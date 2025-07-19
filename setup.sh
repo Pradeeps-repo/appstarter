@@ -70,6 +70,146 @@ EOF
 
 echo -e "${GREEN}📝 Generated random port: ${RANDOM_PORT}${NC}"
 
+# Step 5.1: Create comprehensive .gitignore file
+echo -e "${YELLOW}Step 5.1: Creating .gitignore file...${NC}"
+cat > .gitignore << 'EOF'
+# Dependencies
+node_modules/
+client/node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+lerna-debug.log*
+
+# Build outputs
+dist/
+build/
+client/build/
+
+# Environment variables
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# Runtime data
+pids
+*.pid
+*.seed
+*.pid.lock
+
+# Coverage directory used by tools like istanbul
+coverage/
+*.lcov
+
+# Dependency directories
+jspm_packages/
+
+# TypeScript cache
+*.tsbuildinfo
+
+# Optional npm cache directory
+.npm
+
+# Optional eslint cache
+.eslintcache
+
+# Microbundle cache
+.rpt2_cache/
+.rts2_cache_cjs/
+.rts2_cache_es/
+.rts2_cache_umd/
+
+# Optional REPL history
+.node_repl_history
+
+# Output of 'npm pack'
+*.tgz
+
+# Yarn Integrity file
+.yarn-integrity
+
+# parcel-bundler cache (https://parceljs.org/)
+.cache
+.parcel-cache
+
+# Next.js build output
+.next
+
+# Nuxt.js build / generate output
+.nuxt
+
+# Gatsby files
+.cache/
+public
+
+# Storybook build outputs
+.out
+.storybook-out
+
+# Temporary folders
+tmp/
+temp/
+
+# Editor directories and files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Logs
+logs
+*.log
+
+# Runtime data
+pids
+*.pid
+*.seed
+*.pid.lock
+
+# Optional npm cache directory
+.npm
+
+# Optional REPL history
+.node_repl_history
+
+# Output of 'npm pack'
+*.tgz
+
+# Yarn Integrity file
+.yarn-integrity
+
+# dotenv environment variables file
+.env
+
+# Production build
+/build
+
+# misc
+.DS_Store
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+EOF
+
+echo -e "${GREEN}✅ .gitignore file created${NC}"
+
 # Step 6: Create TypeScript configuration
 echo -e "${YELLOW}Step 6: Creating TypeScript configuration...${NC}"
 cat > tsconfig.json << 'EOF'
@@ -637,7 +777,21 @@ else
     exit 1
 fi
 
-# Step 13: Open project in Cursor and provide instructions
+# Step 13: Initialize Git repository and create initial commit
+echo -e "${YELLOW}Step 13: Initializing Git repository...${NC}"
+
+# Initialize git repository
+git init
+
+# Add all files to git (respecting .gitignore)
+git add .
+
+# Create initial commit
+git commit -m "Initial commit"
+
+echo -e "${GREEN}✅ Git repository initialized with initial commit${NC}"
+
+# Step 14: Open project in Cursor and provide instructions
 echo -e "${GREEN}✅ Master setup complete! Your full-stack Express TypeScript + React + shadcn/ui project is ready.${NC}"
 echo -e "${BLUE}📁 Project structure:${NC}"
 echo -e "${BLUE}  ├── dist/                      # All build outputs${NC}"
@@ -661,6 +815,8 @@ echo -e "${GREEN}  ✅ Random port generation with .env support${NC}"
 echo -e "${GREEN}  ✅ Concurrent development with file watching${NC}"
 echo -e "${GREEN}  ✅ API endpoints on /api routes${NC}"
 echo -e "${GREEN}  ✅ Client-side routing support with catch-all${NC}"
+echo -e "${GREEN}  ✅ Git repository initialization with comprehensive .gitignore${NC}"
+echo -e "${GREEN}  ✅ Initial commit with project structure documentation${NC}"
 echo ""
 echo -e "${YELLOW}🚀 Opening project in Cursor...${NC}"
 
