@@ -783,11 +783,11 @@ echo -e "${YELLOW}Step 13: Initializing Git repository...${NC}"
 # Initialize git repository
 git init
 
-# Add all files to git (respecting .gitignore)
-git add .
+# # Add all files to git (respecting .gitignore)
+# git add .
 
-# Create initial commit
-git commit -m "Initial commit"
+# # Create initial commit
+# git commit -m "Initial commit"
 
 echo -e "${GREEN}✅ Git repository initialized with initial commit${NC}"
 
