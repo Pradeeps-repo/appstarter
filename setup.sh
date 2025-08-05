@@ -247,13 +247,14 @@ EOF
 echo -e "${YELLOW}Step 7: Converting JavaScript files to TypeScript...${NC}"
 
 # Convert indexController.js to TypeScript (API endpoint since we removed jade)
-cat > controllers/indexController.ts << 'EOF'
+cat > controllers/indexController.ts << EOF
 import { Request, Response, NextFunction } from 'express';
 
 function index(req: Request, res: Response, next: NextFunction): void {
     // Return JSON since we're serving React frontend and this is now an API endpoint
     res.json({
-        message: 'Express TypeScript API Server',
+        message: '${PROJECT_NAME} API Server',
+        description: 'Express TypeScript API Server',
         status: 'running',
         timestamp: new Date().toISOString()
     });
@@ -458,6 +459,35 @@ rm -rf client/.git
 
 # Navigate into the client directory
 cd client
+
+# Step 10.1: Update React app name and branding
+echo -e "${YELLOW}Step 10.1: Updating React app name and branding...${NC}"
+
+# Update package.json name
+npm pkg set name="${PROJECT_NAME}-client"
+
+# Update public/index.html title and meta
+sed -i '' "s/<title>React App<\/title>/<title>${PROJECT_NAME}<\/title>/" public/index.html
+sed -i '' "s/content=\"Web site created using create-react-app\"/content=\"${PROJECT_NAME} - Full-stack TypeScript application\"/" public/index.html
+
+# Update manifest.json
+sed -i '' "s/\"name\": \"React App\"/\"name\": \"${PROJECT_NAME}\"/" public/manifest.json
+sed -i '' "s/\"short_name\": \"React App\"/\"short_name\": \"${PROJECT_NAME}\"/" public/manifest.json
+
+# Step 10.2: Download and replace icon files
+echo -e "${YELLOW}Step 10.2: Downloading and replacing icon files...${NC}"
+
+# Download the dice.ico file
+curl -L "https://raw.githubusercontent.com/Pradeeps-repo/appstarter/refs/heads/main/dice.ico" -o public/favicon.ico
+
+# Create PNG versions for different sizes using the downloaded icon
+# Note: We'll use the .ico file directly for favicon and create simple placeholder PNGs
+# Copy the ico file as png placeholders (browsers will handle ico format fine)
+cp public/favicon.ico public/logo192.png
+cp public/favicon.ico public/logo512.png
+
+echo -e "${GREEN}✅ React app branding updated with project name: ${PROJECT_NAME}${NC}"
+echo -e "${GREEN}✅ Icon files replaced with dice.ico${NC}"
 
 # Install dependencies
 npm install --save tailwindcss@^3.4.0 postcss autoprefixer tailwindcss-animate class-variance-authority clsx tailwind-merge lucide-react
@@ -704,22 +734,24 @@ npm pkg set scripts.build="BUILD_PATH=../dist/client react-scripts build"
 # Delete App.css and update App.tsx
 rm -f src/App.css
 
-cat > src/App.tsx << 'EOF'
+cat > src/App.tsx << EOF
 import { useState } from "react";
 import { Button } from "./components/ui/button";
-import logo from "./logo.svg";
 
 function App() {
   const [count, setCount] = useState(0);
   return (
     <div className="App">
       <header className="h-screen flex flex-col items-center justify-center">
-        <img
-          src={logo}
-          className="w-[40vmin] animate-[spin_10s_linear_infinite]"
-          alt="logo"
-        />
-        <p>
+        <div className="mb-8">
+          <img
+            src="/favicon.ico"
+            className="w-24 h-24 mx-auto"
+            alt="${PROJECT_NAME} logo"
+          />
+        </div>
+        <h1 className="text-4xl font-bold mb-4">${PROJECT_NAME}</h1>
+        <p className="text-lg mb-6">
           Edit <code>src/App.tsx</code> and save to reload.
         </p>
         <Button asChild variant="link">
@@ -734,17 +766,21 @@ function App() {
         <Button
           variant="outline"
           onClick={() => setCount((count) => count + 1)}
+          className="ml-4"
         >
           Count is {count}
         </Button>
-                 <div className="mt-4 p-4 bg-green-100 rounded-lg">
-           <p className="text-green-800 font-semibold">
-             🎉 Full-stack app ready! Express TypeScript + React + shadcn/ui
-           </p>
-           <p className="text-green-600 text-sm">
-             This React app is served statically by Express
-           </p>
-         </div>
+        <div className="mt-8 p-6 bg-green-100 rounded-lg max-w-md text-center">
+          <p className="text-green-800 font-semibold text-lg">
+            🎉 ${PROJECT_NAME} is ready!
+          </p>
+          <p className="text-green-600 text-sm mt-2">
+            Full-stack Express TypeScript + React + shadcn/ui
+          </p>
+          <p className="text-green-600 text-sm">
+            This React app is served statically by Express
+          </p>
+        </div>
       </header>
     </div>
   );
@@ -815,6 +851,9 @@ echo -e "${GREEN}  ✅ Random port generation with .env support${NC}"
 echo -e "${GREEN}  ✅ Concurrent development with file watching${NC}"
 echo -e "${GREEN}  ✅ API endpoints on /api routes${NC}"
 echo -e "${GREEN}  ✅ Client-side routing support with catch-all${NC}"
+echo -e "${GREEN}  ✅ Custom branding with project name (${PROJECT_NAME})${NC}"
+echo -e "${GREEN}  ✅ Custom dice icon from GitHub repository${NC}"
+echo -e "${GREEN}  ✅ All default React references replaced with project name${NC}"
 echo -e "${GREEN}  ✅ Git repository initialization with comprehensive .gitignore${NC}"
 echo -e "${GREEN}  ✅ Initial commit with project structure documentation${NC}"
 echo ""
