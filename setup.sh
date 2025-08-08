@@ -423,10 +423,11 @@ function onError(error: NodeJS.ErrnoException): void {
 
 function onListening(): void {
   const addr = server.address();
-  const bind = typeof addr === 'string'
-    ? 'pipe ' + addr
-    : 'port ' + (addr?.port);
-  console.log(`server started:  http://localhost:${bind}`);
+  if (typeof addr === 'string') {
+    console.log(`server started:  http://localhost:${addr}`);
+  } else {
+    console.log(`server started:  http://localhost:${addr?.port}`);
+  }
 }
 EOF
 
