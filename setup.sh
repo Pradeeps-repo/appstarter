@@ -58,7 +58,7 @@ EOF
 
 # Step 4: Install TypeScript dependencies
 echo -e "${YELLOW}Step 4: Installing TypeScript dependencies...${NC}"
-npm install --save-dev typescript @types/node @types/express @types/cookie-parser @types/morgan @types/http-errors @types/debug ts-node nodemon concurrently chokidar dotenv @types/dotenv
+npm install --save-dev typescript @types/node @types/express @types/cookie-parser @types/morgan @types/http-errors @types/debug ts-node nodemon concurrently chokidar-cli dotenv @types/dotenv
 
 # Step 5: Generate random port and create .env file
 echo -e "${YELLOW}Step 5: Creating .env file with random port...${NC}"
