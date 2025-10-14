@@ -338,13 +338,10 @@ cat > bin/www.ts << 'EOF'
  * Module dependencies.
  */
 
-import dotenv from 'dotenv';
+import 'dotenv/config';
 import app from '../app';
 import debugModule from 'debug';
 import http from 'http';
-
-// Load environment variables from .env file
-dotenv.config();
 
 const debug = debugModule('${PROJECT_NAME}:server');
 
@@ -594,8 +591,8 @@ import { Sequelize } from 'sequelize';
 const isProduction = process.env.NODE_ENV === 'production';
 
 let sequelize: Sequelize;
-if (isProduction) {
-  const databaseUrl = process.env.DATABASE_URL as string;
+const databaseUrl = process.env.DATABASE_URL as string | undefined;
+if (isProduction && databaseUrl) {
   sequelize = new Sequelize(databaseUrl, {
     dialect: 'postgres',
     protocol: 'postgres',
@@ -1678,7 +1675,6 @@ echo -e "${YELLOW}🚀 Opening project in Cursor...${NC}"
 # Open project in Cursor
 echo -e "${BLUE}📝 Opening ${PROJECT_NAME} in Cursor...${NC}"
 
-cd ${PROJECT_NAME}
 cursor .
 
 echo ""
