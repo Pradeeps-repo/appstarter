@@ -1672,9 +1672,15 @@ echo -e "${GREEN}  ✅ Initial commit with project structure documentation${NC}"
 echo ""
 echo -e "${YELLOW}🚀 Opening project in Cursor...${NC}"
 
-# Open project in Cursor
-echo -e "${BLUE}📝 Opening ${PROJECT_NAME} in Cursor...${NC}"
+# Ensure we're inside the project directory before opening and starting
+if [ -d "${PROJECT_NAME}" ]; then
+  cd "${PROJECT_NAME}"
+else
+  echo -e "${YELLOW}⚠️  Project directory not found: ${PROJECT_NAME}. Using current directory: $(pwd)${NC}"
+fi
 
+# Open project in Cursor (background)
+echo -e "${BLUE}📝 Opening ${PROJECT_NAME} in Cursor...${NC}"
 nohup cursor . </dev/null >/dev/null 2>&1 &
 
 echo ""
