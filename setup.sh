@@ -449,6 +449,668 @@ npm pkg set scripts.build:client="cd client && npm run build"
 npm pkg set scripts.build:all="npm run build:client && npm run build"
 npm pkg set scripts.clean:all="rm -rf dist client/node_modules/.cache"
 
+# === Auth/RBAC setup (embedded, gated) ===
+# Feature gate (default ON unless explicitly disabled)
+if [ -z "${ENABLE_AUTH_RBAC+x}" ]; then
+    ENABLE_AUTH_RBAC=1
+fi
+
+mkdir -p .appstarter
+
+if [ "$ENABLE_AUTH_RBAC" != "1" ]; then
+    echo -e "${YELLOW}Auth/RBAC setup skipped (ENABLE_AUTH_RBAC=${ENABLE_AUTH_RBAC}).${NC}"
+else
+    echo -e "${YELLOW}Auth/RBAC: Installing ORM/auth/session dependencies...${NC}"
+    npm install --save sequelize sequelize-cli sqlite3 pg pg-hstore passport passport-local passport-jwt bcrypt jsonwebtoken cors express-session connect-session-sequelize dotenv
+    npm install --save-dev @types/express-session @types/bcrypt @types/jsonwebtoken @types/cors @types/passport @types/passport-local @types/passport-jwt
+
+    echo -e "${YELLOW}Auth/RBAC: Writing Sequelize CLI configuration...${NC}"
+    # .sequelizerc to point CLI to our config and folders
+    cat > .sequelizerc << 'EOF'
+const path = require('path');
+
+module.exports = {
+  config: path.resolve('db', 'config.cjs'),
+  'migrations-path': path.resolve('db', 'migrations'),
+  'seeders-path': path.resolve('db', 'seeders'),
+  'models-path': path.resolve('models')
+};
+EOF
+
+    # Ensure required directories exist
+    mkdir -p db/migrations db/seeders var
+
+    # Sequelize environment config (dev=test sqlite, prod postgres via DATABASE_URL)
+    cat > db/config.cjs << 'EOF'
+/**
+ * Sequelize CLI configuration for different environments.
+ * Dev/Test use SQLite with storage from SQLITE_STORAGE, Prod uses DATABASE_URL (Postgres).
+ */
+module.exports = {
+  development: {
+    dialect: 'sqlite',
+    storage: process.env.SQLITE_STORAGE || './var/dev.sqlite',
+    logging: false,
+  },
+  test: {
+    dialect: 'sqlite',
+    storage: process.env.SQLITE_STORAGE || ':memory:',
+    logging: false,
+  },
+  production: {
+    use_env_variable: 'DATABASE_URL',
+    dialect: 'postgres',
+    protocol: 'postgres',
+    logging: false,
+    dialectOptions: {
+      ssl: process.env.PGSSL === '0' ? false : { require: true, rejectUnauthorized: false },
+    },
+  },
+};
+EOF
+
+    echo -e "${YELLOW}Auth/RBAC: Ensuring .env contains required secrets and settings...${NC}"
+    # Ensure .env exists
+    if [ ! -f .env ]; then
+        cat > .env << EOF
+PORT=${RANDOM_PORT}
+NODE_ENV=development
+EOF
+    fi
+
+    # Helper to append key=value if key not present
+    ensure_env() {
+        local key="$1"; local value="$2"
+        if ! grep -q "^${key}=" .env 2>/dev/null; then
+            echo "${key}=${value}" >> .env
+        fi
+    }
+
+    # Generate secrets if missing
+    SESSION_SECRET_VALUE=$(node -e "console.log(require('crypto').randomBytes(32).toString('hex'))" 2>/dev/null)
+    JWT_SECRET_VALUE=$(node -e "console.log(require('crypto').randomBytes(32).toString('hex'))" 2>/dev/null)
+
+    ensure_env "SQLITE_STORAGE" "./var/dev.sqlite"
+    ensure_env "SESSION_SECRET" "${SESSION_SECRET_VALUE:-change-me-session}"
+    ensure_env "JWT_SECRET" "${JWT_SECRET_VALUE:-change-me-jwt}"
+    ensure_env "JWT_ACCESS_TTL" "15m"
+    ensure_env "JWT_REFRESH_TTL" "7d"
+
+    echo -e "${YELLOW}Auth/RBAC: Adding npm database scripts...${NC}"
+    npm pkg set scripts.db:migrate="sequelize-cli db:migrate"
+    npm pkg set scripts.db:migrate:undo="sequelize-cli db:migrate:undo"
+    npm pkg set scripts.db:seed="sequelize-cli db:seed:all"
+    npm pkg set scripts.db:reset="sequelize-cli db:migrate:undo:all && sequelize-cli db:migrate && sequelize-cli db:seed:all"
+
+    # Mark bootstrap completion
+    if [ ! -f .appstarter/.auth_rbac_bootstrap_done ]; then
+        echo "bootstrapped" > .appstarter/.auth_rbac_bootstrap_done
+    fi
+
+    echo -e "${YELLOW}Auth/RBAC: Scaffolding TypeScript DB init and models...${NC}"
+
+    mkdir -p db models auth middleware
+
+    # Update tsconfig.json include globs to compile new folders
+    cat > tsconfig.json << 'EOF'
+{
+  "compilerOptions": {
+    "target": "ES2020",
+    "module": "commonjs",
+    "lib": ["ES2020"],
+    "outDir": "./dist",
+    "rootDir": "./",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "resolveJsonModule": true,
+    "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true
+  },
+  "include": [
+    "app.ts",
+    "bin/**/*",
+    "routes/**/*",
+    "controllers/**/*",
+    "models/**/*",
+    "db/**/*",
+    "auth/**/*",
+    "middleware/**/*"
+  ],
+  "exclude": [
+    "node_modules",
+    "client",
+    "dist"
+  ]
+}
+EOF
+
+    # DB init using Sequelize (SQLite dev, Postgres prod)
+    cat > db/sequelize.ts << 'EOF'
+import { Sequelize } from 'sequelize';
+
+const isProduction = process.env.NODE_ENV === 'production';
+
+let sequelize: Sequelize;
+if (isProduction) {
+  const databaseUrl = process.env.DATABASE_URL as string;
+  sequelize = new Sequelize(databaseUrl, {
+    dialect: 'postgres',
+    protocol: 'postgres',
+    logging: false,
+    dialectOptions: {
+      ssl: process.env.PGSSL === '0' ? false : { require: true, rejectUnauthorized: false },
+    },
+  });
+} else {
+  sequelize = new Sequelize({
+    dialect: 'sqlite',
+    storage: process.env.SQLITE_STORAGE || './var/dev.sqlite',
+    logging: false,
+  });
+}
+
+export default sequelize;
+EOF
+
+    # Models and associations
+    cat > models/index.ts << 'EOF'
+import { DataTypes, InferAttributes, InferCreationAttributes, Model, CreationOptional } from 'sequelize';
+import sequelize from '../db/sequelize';
+
+export class User extends Model<InferAttributes<User>, InferCreationAttributes<User>> {
+  declare id: CreationOptional<string>;
+  declare email: string;
+  declare passwordHash: string;
+  declare firstName: CreationOptional<string | null>;
+  declare lastName: CreationOptional<string | null>;
+  declare isActive: CreationOptional<boolean>;
+  declare lastLoginAt: CreationOptional<Date | null>;
+}
+
+export class Role extends Model<InferAttributes<Role>, InferCreationAttributes<Role>> {
+  declare id: CreationOptional<string>;
+  declare name: string;
+}
+
+export class Permission extends Model<InferAttributes<Permission>, InferCreationAttributes<Permission>> {
+  declare id: CreationOptional<string>;
+  declare name: string;
+}
+
+export class RefreshToken extends Model<InferAttributes<RefreshToken>, InferCreationAttributes<RefreshToken>> {
+  declare id: CreationOptional<string>;
+  declare userId: string;
+  declare tokenHash: string;
+  declare jti: string;
+  declare revokedAt: CreationOptional<Date | null>;
+  declare expiresAt: Date;
+}
+
+User.init({
+  id: { type: DataTypes.UUID, defaultValue: DataTypes.UUIDV4, primaryKey: true },
+  email: { type: DataTypes.STRING, allowNull: false, unique: true },
+  passwordHash: { type: DataTypes.STRING, allowNull: false },
+  firstName: { type: DataTypes.STRING, allowNull: true },
+  lastName: { type: DataTypes.STRING, allowNull: true },
+  isActive: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: true },
+  lastLoginAt: { type: DataTypes.DATE, allowNull: true },
+}, { sequelize, modelName: 'User', tableName: 'Users', timestamps: true });
+
+Role.init({
+  id: { type: DataTypes.UUID, defaultValue: DataTypes.UUIDV4, primaryKey: true },
+  name: { type: DataTypes.STRING, allowNull: false, unique: true },
+}, { sequelize, modelName: 'Role', tableName: 'Roles', timestamps: true });
+
+Permission.init({
+  id: { type: DataTypes.UUID, defaultValue: DataTypes.UUIDV4, primaryKey: true },
+  name: { type: DataTypes.STRING, allowNull: false, unique: true },
+}, { sequelize, modelName: 'Permission', tableName: 'Permissions', timestamps: true });
+
+RefreshToken.init({
+  id: { type: DataTypes.UUID, defaultValue: DataTypes.UUIDV4, primaryKey: true },
+  userId: { type: DataTypes.UUID, allowNull: false },
+  tokenHash: { type: DataTypes.STRING, allowNull: false },
+  jti: { type: DataTypes.STRING, allowNull: false, unique: true },
+  revokedAt: { type: DataTypes.DATE, allowNull: true },
+  expiresAt: { type: DataTypes.DATE, allowNull: false },
+}, { sequelize, modelName: 'RefreshToken', tableName: 'RefreshTokens', timestamps: true });
+
+// Associations
+User.belongsToMany(Role, { through: 'UserRoles', foreignKey: 'userId' });
+Role.belongsToMany(User, { through: 'UserRoles', foreignKey: 'roleId' });
+
+Role.belongsToMany(Permission, { through: 'RolePermissions', foreignKey: 'roleId' });
+Permission.belongsToMany(Role, { through: 'RolePermissions', foreignKey: 'permissionId' });
+
+User.hasMany(RefreshToken, { foreignKey: 'userId' });
+RefreshToken.belongsTo(User, { foreignKey: 'userId' });
+
+export default { sequelize, User, Role, Permission, RefreshToken };
+EOF
+
+    echo -e "${YELLOW}Auth/RBAC: Adding Passport strategies and JWT helpers...${NC}"
+
+    # JWT helpers
+    cat > auth/jwt.ts << 'EOF'
+import jwt, { SignOptions, Secret } from 'jsonwebtoken';
+import crypto from 'crypto';
+import { addMs } from './ttl';
+import models from '../models';
+
+export function issueAccessToken(user: any, roles: string[]) {
+  const secret: Secret = (process.env.JWT_SECRET as string) || 'change-me';
+  const ttl = (process.env.JWT_ACCESS_TTL as string) || '15m';
+  const payload = { sub: user.id, roles };
+  const options: SignOptions = { expiresIn: ttl as any };
+  return jwt.sign(payload, secret, options);
+}
+
+export async function issueRefreshToken(user: any) {
+  const randomToken = crypto.randomBytes(48).toString('hex');
+  const jti = crypto.randomUUID();
+  const tokenHash = crypto.createHash('sha256').update(randomToken).digest('hex');
+  const ttl = (process.env.JWT_REFRESH_TTL as string) || '7d';
+  const expiresAt = new Date(Date.now() + addMs(ttl));
+  await models.RefreshToken.create({ userId: user.id, tokenHash, jti, expiresAt });
+  return { refreshToken: randomToken, jti, expiresAt };
+}
+
+export async function rotateRefreshToken(userId: string, presentedToken: string) {
+  const tokenHash = crypto.createHash('sha256').update(presentedToken).digest('hex');
+  const record: any = await models.RefreshToken.findOne({ where: { userId, tokenHash, revokedAt: null } });
+  if (!record) return null;
+  if (record.expiresAt.getTime() < Date.now()) return null;
+  record.revokedAt = new Date();
+  await record.save();
+  return issueRefreshToken({ id: userId });
+}
+
+export function verifyAccessToken(token: string) {
+  const secret: Secret = (process.env.JWT_SECRET as string) || 'change-me';
+  return jwt.verify(token, secret);
+}
+EOF
+
+    # TTL helper
+    cat > auth/ttl.ts << 'EOF'
+// Very small TTL parser supporting m,h,d suffixes
+export function addMs(ttl: string): number {
+  const m = ttl.match(/^(\d+)(ms|s|m|h|d)$/);
+  if (!m) return 0;
+  const n = parseInt(m[1], 10);
+  const u = m[2];
+  switch (u) {
+    case 'ms': return n;
+    case 's': return n * 1000;
+    case 'm': return n * 60 * 1000;
+    case 'h': return n * 60 * 60 * 1000;
+    case 'd': return n * 24 * 60 * 60 * 1000;
+    default: return 0;
+  }
+}
+EOF
+
+    # Passport strategies
+    cat > auth/passport.ts << 'EOF'
+import passport from 'passport';
+import { Strategy as LocalStrategy } from 'passport-local';
+import { Strategy as JwtStrategy, ExtractJwt } from 'passport-jwt';
+import bcrypt from 'bcrypt';
+import models from '../models';
+
+passport.serializeUser((user: any, done: (err: any, id?: any) => void) => done(null, user.id));
+passport.deserializeUser(async (id: string, done: (err: any, user?: any) => void) => {
+  try {
+    const user = await models.User.findByPk(id);
+    done(null, user);
+  } catch (e) {
+    done(e, undefined);
+  }
+});
+
+passport.use(new LocalStrategy({ usernameField: 'email' }, async (email: string, password: string, done: (err: any, user?: any, info?: any) => void) => {
+  try {
+    const user: any = await models.User.findOne({ where: { email } });
+    if (!user || !user.isActive) return done(null, false);
+    const ok = await bcrypt.compare(password, user.passwordHash);
+    if (!ok) return done(null, false);
+    user.lastLoginAt = new Date();
+    await user.save();
+    return done(null, user);
+  } catch (e) {
+    return done(e);
+  }
+}));
+
+passport.use(new JwtStrategy({
+  jwtFromRequest: ExtractJwt.fromAuthHeaderAsBearerToken(),
+  secretOrKey: (process.env.JWT_SECRET as string) || 'change-me',
+}, async (payload: any, done: (err: any, user?: any, info?: any) => void) => {
+  try {
+    const user: any = await models.User.findByPk(payload.sub);
+    if (!user || !user.isActive) return done(null, false);
+    return done(null, { id: user.id, roles: payload.roles });
+  } catch (e) {
+    done(e, false);
+  }
+}));
+
+export default passport;
+EOF
+
+    echo -e "${YELLOW}Auth/RBAC: Adding RBAC middleware...${NC}"
+    cat > middleware/rbac.ts << 'EOF'
+import { Request, Response, NextFunction } from 'express';
+
+export function requireRole(required: string[]) {
+  return (req: Request, res: Response, next: NextFunction) => {
+    const roles: string[] = (req as any).user?.roles || [];
+    if (!required.some(r => roles.includes(r))) {
+      return res.status(403).json({ error: 'Forbidden' });
+    }
+    next();
+  };
+}
+
+export function requirePermission(required: string[]) {
+  return (req: Request, res: Response, next: NextFunction) => {
+    const perms: string[] = (req as any).user?.permissions || [];
+    if (!required.some(p => perms.includes(p))) {
+      return res.status(403).json({ error: 'Forbidden' });
+    }
+    next();
+  };
+}
+EOF
+
+    echo -e "${YELLOW}Auth/RBAC: Adding auth routes (session + JWT)...${NC}"
+    cat > routes/auth.web.ts << 'EOF'
+import express from 'express';
+import passport from '../auth/passport';
+
+const router = express.Router();
+
+router.post('/login', passport.authenticate('local'), (req, res) => {
+  const user = (req as any).user;
+  res.json({ id: user.id, email: user.email });
+});
+
+router.post('/logout', (req, res, next) => {
+  (req as any).logout((err: any) => {
+    if (err) return next(err);
+    res.json({ ok: true });
+  });
+});
+
+router.get('/me', (req, res) => {
+  if (!(req as any).isAuthenticated || !(req as any).isAuthenticated()) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  const user = (req as any).user;
+  res.json({ id: user.id, email: user.email });
+});
+
+export default router;
+EOF
+
+    cat > routes/auth.api.ts << 'EOF'
+import express from 'express';
+import passport from '../auth/passport';
+import { issueAccessToken, issueRefreshToken, rotateRefreshToken } from '../auth/jwt';
+import models from '../models';
+
+const router = express.Router();
+
+router.post('/login', (req, res, next) => {
+  passport.authenticate('local', { session: false }, async (err: any, user: any, info: any) => {
+    if (err || !user) return res.status(401).json({ error: 'Invalid credentials' });
+    const roles = await user.getRoles().then((rs: any[]) => rs.map(r => r.name));
+    const accessToken = issueAccessToken(user, roles);
+    const { refreshToken, jti, expiresAt } = await issueRefreshToken(user);
+    res.json({ accessToken, refreshToken, jti, expiresAt });
+  })(req, res, next);
+});
+
+router.post('/refresh', async (req, res) => {
+  const { userId, refreshToken } = req.body || {};
+  if (!userId || !refreshToken) return res.status(400).json({ error: 'Missing params' });
+  const rotated = await rotateRefreshToken(userId, refreshToken);
+  if (!rotated) return res.status(401).json({ error: 'Invalid refresh token' });
+  const user = await models.User.findByPk(userId);
+  if (!user) return res.status(401).json({ error: 'Invalid user' });
+  const roles = await (user as any).getRoles().then((rs: any[]) => rs.map(r => r.name));
+  const accessToken = issueAccessToken(user, roles);
+  res.json({ accessToken, refreshToken: rotated.refreshToken, jti: rotated.jti, expiresAt: rotated.expiresAt });
+});
+
+router.get('/me', passport.authenticate('jwt', { session: false }), async (req, res) => {
+  res.json({ user: (req as any).user });
+});
+
+export default router;
+EOF
+
+    echo -e "${YELLOW}Auth/RBAC: Creating initial migration and seeders...${NC}"
+    cat > db/migrations/20231010120000-init-auth.js << 'EOF'
+'use strict';
+
+module.exports = {
+  async up(queryInterface, Sequelize) {
+    await queryInterface.createTable('Users', {
+      id: { type: Sequelize.UUID, primaryKey: true, allowNull: false },
+      email: { type: Sequelize.STRING, allowNull: false, unique: true },
+      passwordHash: { type: Sequelize.STRING, allowNull: false },
+      firstName: { type: Sequelize.STRING },
+      lastName: { type: Sequelize.STRING },
+      isActive: { type: Sequelize.BOOLEAN, allowNull: false, defaultValue: true },
+      lastLoginAt: { type: Sequelize.DATE },
+      createdAt: { type: Sequelize.DATE, allowNull: false, defaultValue: Sequelize.literal('CURRENT_TIMESTAMP') },
+      updatedAt: { type: Sequelize.DATE, allowNull: false, defaultValue: Sequelize.literal('CURRENT_TIMESTAMP') },
+    });
+
+    await queryInterface.createTable('Roles', {
+      id: { type: Sequelize.UUID, primaryKey: true, allowNull: false },
+      name: { type: Sequelize.STRING, allowNull: false, unique: true },
+      createdAt: { type: Sequelize.DATE, allowNull: false, defaultValue: Sequelize.literal('CURRENT_TIMESTAMP') },
+      updatedAt: { type: Sequelize.DATE, allowNull: false, defaultValue: Sequelize.literal('CURRENT_TIMESTAMP') },
+    });
+
+    await queryInterface.createTable('Permissions', {
+      id: { type: Sequelize.UUID, primaryKey: true, allowNull: false },
+      name: { type: Sequelize.STRING, allowNull: false, unique: true },
+      createdAt: { type: Sequelize.DATE, allowNull: false, defaultValue: Sequelize.literal('CURRENT_TIMESTAMP') },
+      updatedAt: { type: Sequelize.DATE, allowNull: false, defaultValue: Sequelize.literal('CURRENT_TIMESTAMP') },
+    });
+
+    await queryInterface.createTable('UserRoles', {
+      userId: { type: Sequelize.UUID, allowNull: false },
+      roleId: { type: Sequelize.UUID, allowNull: false },
+      createdAt: { type: Sequelize.DATE, allowNull: false, defaultValue: Sequelize.literal('CURRENT_TIMESTAMP') },
+      updatedAt: { type: Sequelize.DATE, allowNull: false, defaultValue: Sequelize.literal('CURRENT_TIMESTAMP') },
+    });
+    await queryInterface.addConstraint('UserRoles', { fields: ['userId', 'roleId'], type: 'unique', name: 'ux_user_roles_user_role' });
+
+    await queryInterface.createTable('RolePermissions', {
+      roleId: { type: Sequelize.UUID, allowNull: false },
+      permissionId: { type: Sequelize.UUID, allowNull: false },
+      createdAt: { type: Sequelize.DATE, allowNull: false, defaultValue: Sequelize.literal('CURRENT_TIMESTAMP') },
+      updatedAt: { type: Sequelize.DATE, allowNull: false, defaultValue: Sequelize.literal('CURRENT_TIMESTAMP') },
+    });
+    await queryInterface.addConstraint('RolePermissions', { fields: ['roleId', 'permissionId'], type: 'unique', name: 'ux_role_permissions_role_perm' });
+
+    await queryInterface.createTable('RefreshTokens', {
+      id: { type: Sequelize.UUID, primaryKey: true, allowNull: false },
+      userId: { type: Sequelize.UUID, allowNull: false },
+      tokenHash: { type: Sequelize.STRING, allowNull: false },
+      jti: { type: Sequelize.STRING, allowNull: false, unique: true },
+      revokedAt: { type: Sequelize.DATE },
+      expiresAt: { type: Sequelize.DATE, allowNull: false },
+      createdAt: { type: Sequelize.DATE, allowNull: false, defaultValue: Sequelize.literal('CURRENT_TIMESTAMP') },
+      updatedAt: { type: Sequelize.DATE, allowNull: false, defaultValue: Sequelize.literal('CURRENT_TIMESTAMP') },
+    });
+  },
+
+  async down(queryInterface) {
+    await queryInterface.dropTable('RefreshTokens');
+    await queryInterface.dropTable('RolePermissions');
+    await queryInterface.dropTable('UserRoles');
+    await queryInterface.dropTable('Permissions');
+    await queryInterface.dropTable('Roles');
+    await queryInterface.dropTable('Users');
+  }
+};
+EOF
+
+    cat > db/seeders/20231010121000-seed-rbac.js << 'EOF'
+'use strict';
+
+const bcrypt = require('bcrypt');
+const { randomUUID } = require('crypto');
+
+module.exports = {
+  async up(queryInterface, Sequelize) {
+    const [adminRoleId, userRoleId] = [randomUUID(), randomUUID()];
+    const [usersReadId, usersWriteId, rolesReadId, rolesWriteId] = [
+      randomUUID(),
+      randomUUID(),
+      randomUUID(),
+      randomUUID(),
+    ];
+
+    await queryInterface.bulkInsert('Roles', [
+      { id: adminRoleId, name: 'admin', createdAt: new Date(), updatedAt: new Date() },
+      { id: userRoleId, name: 'user', createdAt: new Date(), updatedAt: new Date() },
+    ]);
+
+    await queryInterface.bulkInsert('Permissions', [
+      { id: usersReadId, name: 'users.read', createdAt: new Date(), updatedAt: new Date() },
+      { id: usersWriteId, name: 'users.write', createdAt: new Date(), updatedAt: new Date() },
+      { id: rolesReadId, name: 'roles.read', createdAt: new Date(), updatedAt: new Date() },
+      { id: rolesWriteId, name: 'roles.write', createdAt: new Date(), updatedAt: new Date() },
+    ]);
+
+    await queryInterface.bulkInsert('RolePermissions', [
+      { roleId: adminRoleId, permissionId: usersReadId, createdAt: new Date(), updatedAt: new Date() },
+      { roleId: adminRoleId, permissionId: usersWriteId, createdAt: new Date(), updatedAt: new Date() },
+      { roleId: adminRoleId, permissionId: rolesReadId, createdAt: new Date(), updatedAt: new Date() },
+      { roleId: adminRoleId, permissionId: rolesWriteId, createdAt: new Date(), updatedAt: new Date() },
+    ]);
+
+    const adminEmail = process.env.ADMIN_EMAIL || 'admin@example.com';
+    const adminPassword = process.env.ADMIN_PASSWORD || 'Admin123!';
+    const passwordHash = await bcrypt.hash(adminPassword, 12);
+    const adminUserId = randomUUID();
+
+    await queryInterface.bulkInsert('Users', [
+      { id: adminUserId, email: adminEmail, passwordHash, isActive: true, createdAt: new Date(), updatedAt: new Date() },
+    ]);
+
+    await queryInterface.bulkInsert('UserRoles', [
+      { userId: adminUserId, roleId: adminRoleId, createdAt: new Date(), updatedAt: new Date() },
+    ]);
+  },
+
+  async down(queryInterface) {
+    await queryInterface.bulkDelete('UserRoles', null, {});
+    await queryInterface.bulkDelete('Users', null, {});
+    await queryInterface.bulkDelete('RolePermissions', null, {});
+    await queryInterface.bulkDelete('Permissions', null, {});
+    await queryInterface.bulkDelete('Roles', null, {});
+  }
+};
+EOF
+
+    echo -e "${YELLOW}Auth/RBAC: Running migrations/seeds (dev by default)...${NC}"
+    if [ -z "${RUN_DB_MIGRATIONS+x}" ]; then RUN_DB_MIGRATIONS=1; fi
+    if [ -z "${RUN_DB_SEEDS+x}" ]; then RUN_DB_SEEDS=1; fi
+    if [ "${NODE_ENV}" = "production" ]; then
+      # Default skip in prod unless explicitly enabled
+      if [ "${RUN_DB_MIGRATIONS}" = "1" ]; then echo -e "${YELLOW}Skipping migrations in production by default.${NC}"; RUN_DB_MIGRATIONS=0; fi
+      if [ "${RUN_DB_SEEDS}" = "1" ]; then echo -e "${YELLOW}Skipping seeds in production by default.${NC}"; RUN_DB_SEEDS=0; fi
+    fi
+    if [ "${RUN_DB_MIGRATIONS}" = "1" ]; then npx sequelize-cli db:migrate; fi
+    if [ "${RUN_DB_SEEDS}" = "1" ]; then npx sequelize-cli db:seed:all; fi
+
+    echo -e "${YELLOW}Auth/RBAC: Updating server to wire sessions, Passport, and routes...${NC}"
+    cat > app.ts << 'EOF'
+import createError from 'http-errors';
+import express, { Request, Response, NextFunction } from 'express';
+import path from 'path';
+import cookieParser from 'cookie-parser';
+import logger from 'morgan';
+import session from 'express-session';
+import cors from 'cors';
+import passport from './auth/passport';
+import sequelize from './db/sequelize';
+import indexRouter from './routes/index';
+import authWeb from './routes/auth.web';
+import authApi from './routes/auth.api';
+
+const app = express();
+
+app.use(logger('dev'));
+app.use(express.json());
+app.use(express.urlencoded({ extended: false }));
+app.use(cookieParser());
+
+// Serve static files from public directory
+app.use(express.static(path.join(__dirname, 'public')));
+
+// Serve React client build files statically from dist/client
+app.use(express.static(path.join(__dirname, 'dist/client')));
+
+// Sessions (web) with Sequelize store
+const SequelizeStore = require('connect-session-sequelize')(session.Store);
+const store = new SequelizeStore({ db: sequelize });
+const isProduction = process.env.NODE_ENV === 'production';
+if (isProduction) {
+  app.set('trust proxy', 1);
+}
+app.use(session({
+  secret: process.env.SESSION_SECRET || 'change-me',
+  resave: false,
+  saveUninitialized: false,
+  store,
+  cookie: { httpOnly: true, sameSite: 'lax', secure: isProduction },
+}));
+store.sync();
+
+app.use(cors());
+app.use(passport.initialize());
+app.use(passport.session());
+
+// API routes
+app.use('/api', indexRouter);
+app.use('/auth', authWeb); // session-based web auth
+app.use('/api/auth', authApi); // JWT-based API auth
+
+// Catch-all handler to serve React app for client-side routing
+app.get('*', (req: Request, res: Response) => {
+  res.sendFile(path.join(__dirname, 'dist/client', 'index.html'));
+});
+
+// 404 handler
+app.use(function(req: Request, res: Response, next: NextFunction) {
+  next(createError(404));
+});
+
+// error handler
+app.use(function(err: any, req: Request, res: Response, next: NextFunction) {
+  res.locals.message = err.message;
+  res.locals.error = req.app.get('env') === 'development' ? err : {};
+  res.status(err.status || 500);
+  res.json({ error: err.message });
+});
+
+export default app;
+EOF
+
+    echo -e "${GREEN}✅ Auth/RBAC scaffolding complete (models, strategies, routes, server wiring).${NC}"
+fi
+
 # Step 10: Create React client using the existing script logic
 echo -e "${YELLOW}Step 10: Setting up React client with shadcn/ui...${NC}"
 
@@ -732,62 +1394,112 @@ npx shadcn@latest add button
 npm pkg set homepage="."
 npm pkg set scripts.build="BUILD_PATH=../dist/client react-scripts build"
 
+# Install client routing and add shadcn inputs
+npm install --save react-router-dom
+npx shadcn@latest add input
+npx shadcn@latest add label
+
 # Delete App.css and update App.tsx
 rm -f src/App.css
 
 cat > src/App.tsx << EOF
-import { useState } from "react";
-import { Button } from "./components/ui/button";
+import { Routes, Route, Link } from 'react-router-dom';
+import { Button } from './components/ui/button';
+import Login from './pages/Login';
 
-function App() {
-  const [count, setCount] = useState(0);
+function Home() {
   return (
-    <div className="App">
-      <header className="h-screen flex flex-col items-center justify-center">
-        <div className="mb-8">
-          <img
-            src="/favicon.ico"
-            className="w-24 h-24 mx-auto"
-            alt="${PROJECT_NAME} logo"
-          />
-        </div>
-        <h1 className="text-4xl font-bold mb-4">${PROJECT_NAME}</h1>
-        <p className="text-lg mb-6">
-          Edit <code>src/App.tsx</code> and save to reload.
-        </p>
-        <Button asChild variant="link">
-          <a
-            href="https://reactjs.org"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            Learn React
-          </a>
-        </Button>
-        <Button
-          variant="outline"
-          onClick={() => setCount((count) => count + 1)}
-          className="ml-4"
-        >
-          Count is {count}
-        </Button>
-        <div className="mt-8 p-6 bg-green-100 rounded-lg max-w-md text-center">
-          <p className="text-green-800 font-semibold text-lg">
-            🎉 ${PROJECT_NAME} is ready!
-          </p>
-          <p className="text-green-600 text-sm mt-2">
-            Full-stack Express TypeScript + React + shadcn/ui
-          </p>
-          <p className="text-green-600 text-sm">
-            This React app is served statically by Express
-          </p>
-        </div>
-      </header>
+    <div className="min-h-screen flex flex-col items-center justify-center p-6">
+      <img src="/favicon.ico" className="w-24 h-24 mb-6" alt="${PROJECT_NAME} logo" />
+      <h1 className="text-4xl font-bold mb-4">${PROJECT_NAME}</h1>
+      <p className="text-muted-foreground mb-6">Full-stack Express TypeScript + React + shadcn/ui</p>
+      <Button asChild>
+        <a href="https://reactjs.org" target="_blank" rel="noopener noreferrer">Learn React</a>
+      </Button>
     </div>
   );
 }
 
-export default App;
+export default function App() {
+  return (
+    <Routes>
+      <Route path="/" element={<Login />} />
+      <Route path="/home" element={<Home />} />
+    </Routes>
+  );
+}
+EOF
+
+# Wrap with BrowserRouter
+cat > src/index.tsx << 'EOF'
+import React from 'react';
+import ReactDOM from 'react-dom/client';
+import { BrowserRouter } from 'react-router-dom';
+import './index.css';
+import App from './App';
+
+const root = ReactDOM.createRoot(document.getElementById('root') as HTMLElement);
+root.render(
+  <React.StrictMode>
+    <BrowserRouter>
+      <App />
+    </BrowserRouter>
+  </React.StrictMode>
+);
+EOF
+
+# Create Login page using shadcn components
+mkdir -p src/pages
+cat > src/pages/Login.tsx << 'EOF'
+import { useState } from 'react';
+import { useNavigate } from 'react-router-dom';
+import { Button } from '../components/ui/button';
+import { Input } from '../components/ui/input';
+import { Label } from '../components/ui/label';
+
+export default function Login() {
+  const [email, setEmail] = useState('admin@example.com');
+  const [password, setPassword] = useState('Admin123!');
+  const [message, setMessage] = useState<string | null>(null);
+  const navigate = useNavigate();
+
+  async function loginSession(e: React.FormEvent) {
+    e.preventDefault();
+    setMessage(null);
+    try {
+      const res = await fetch('/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email, password }),
+      });
+      if (!res.ok) throw new Error('Invalid credentials');
+      await res.json();
+      navigate('/home');
+    } catch (err: any) {
+      setMessage(err.message || 'Login failed');
+    }
+  }
+
+  return (
+    <div className="min-h-screen flex items-center justify-center p-6">
+      <div className="w-full max-w-sm border rounded-lg p-6">
+        <h1 className="text-2xl font-semibold mb-4">Sign in</h1>
+        <form className="space-y-4" onSubmit={loginSession}>
+          <div className="grid gap-2">
+            <Label htmlFor="email">Email</Label>
+            <Input id="email" type="email" value={email} onChange={e => setEmail(e.target.value)} required />
+          </div>
+          <div className="grid gap-2">
+            <Label htmlFor="password">Password</Label>
+            <Input id="password" type="password" value={password} onChange={e => setPassword(e.target.value)} required />
+          </div>
+          <Button type="submit" className="w-full">Login</Button>
+        </form>
+        {message && <p className="text-sm text-muted-foreground mt-4">{message}</p>}
+      </div>
+    </div>
+  );
+}
 EOF
 
 # Step 11: Build client and return to project root
@@ -827,6 +1539,109 @@ git init
 # git commit -m "Initial commit"
 
 echo -e "${GREEN}✅ Git repository initialized with initial commit${NC}"
+
+# Step 13.1: Add Cursor rules for shadcn/ui usage
+echo -e "${YELLOW}Adding .cursorrules for shadcn/ui guidance...${NC}"
+cat > .cursorrules << 'EOF'
+---
+description: "Use shadcn/ui components as needed for any UI code"
+patterns: "*.tsx"
+---
+
+# Shadcn UI Components
+
+This project uses @shadcn/ui for UI components. These are beautifully designed, accessible components that you can copy and paste into your apps.
+
+## Finding and Using Components
+
+Components are available in the `src/components/ui` directory, following the aliases configured in `components.json`
+
+## Using Components
+
+Import components from the ui directory using the configured aliases:
+
+```tsx
+import { Button } from "@/components/ui/button"
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
+import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from "@/components/ui/card"
+```
+
+Example usage:
+
+```tsx
+<Button variant="outline">Click me</Button>
+
+<Card>
+  <CardHeader>
+    <CardTitle>Card Title</CardTitle>
+    <CardDescription>Card Description</CardDescription>
+  </CardHeader>
+  <CardContent>
+    <p>Card Content</p>
+  </CardContent>
+  <CardFooter>
+    <p>Card Footer</p>
+  </CardFooter>
+</Card>
+```
+
+## Installing Additional Components
+
+Many more components are available but not currently installed. You can view the complete list at https://ui.shadcn.com/r
+
+To install additional components, use the Shadcn CLI:
+
+```bash
+npx shadcn@latest add [component-name]
+```
+
+For example, to add the Accordion component:
+
+```bash
+npx shadcn@latest add accordion
+```
+
+Note: `npx shadcn-ui@latest` is deprecated, use `npx shadcn@latest` instead
+
+Some commonly used components are
+
+- Accordion
+- Alert
+- AlertDialog
+- AspectRatio
+- Avatar
+- Calendar
+- Checkbox
+- Collapsible
+- Command
+- ContextMenu
+- DataTable
+- DatePicker
+- Dropdown Menu
+- Form
+- Hover Card
+- Menubar
+- Navigation Menu
+- Popover
+- Progress
+- Radio Group
+- ScrollArea
+- Select
+- Separator
+- Sheet
+- Skeleton
+- Slider
+- Switch
+- Table
+- Textarea
+- Toast
+- Toggle
+- Tooltip
+
+## Component Styling
+
+This project uses the "new-york" style variant with the "neutral" base color and CSS variables for theming, as configured in `components.json`.
+EOF
 
 # Step 14: Open project in Cursor and provide instructions
 echo -e "${GREEN}✅ Master setup complete! Your full-stack Express TypeScript + React + shadcn/ui project is ready.${NC}"
@@ -890,3 +1705,6 @@ echo -e "${GREEN}  • Random port (${RANDOM_PORT}) from .env file${NC}"
 echo ""
 echo -e "${BLUE}✨ Happy coding! Your project is now open in Cursor.${NC}"
 echo -e "${BLUE}💻 Run 'npm run dev' to start development!${NC}"
+
+echo -e "${YELLOW}🚀 Starting development server...${NC}"
+npm run dev
