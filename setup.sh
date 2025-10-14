@@ -1675,7 +1675,7 @@ echo -e "${YELLOW}🚀 Opening project in Cursor...${NC}"
 # Open project in Cursor
 echo -e "${BLUE}📝 Opening ${PROJECT_NAME} in Cursor...${NC}"
 
-cursor .
+nohup cursor . </dev/null >/dev/null 2>&1 &
 
 echo ""
 echo -e "${GREEN}🎉 Your full-stack TypeScript application is ready!${NC}"
