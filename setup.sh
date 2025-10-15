@@ -461,6 +461,10 @@ else
     npm install --save sequelize sequelize-cli sqlite3 pg pg-hstore passport passport-local passport-jwt bcrypt jsonwebtoken cors express-session connect-session-sequelize dotenv
     npm install --save-dev @types/express-session @types/bcrypt @types/jsonwebtoken @types/cors @types/passport @types/passport-local @types/passport-jwt
 
+    echo -e "${YELLOW}Auth/RBAC: Installing hardening dependencies (zod, helmet, rate-limit, nodemailer)...${NC}"
+    npm install --save zod helmet express-rate-limit nodemailer
+    npm install --save-dev @types/helmet @types/nodemailer
+
     echo -e "${YELLOW}Auth/RBAC: Writing Sequelize CLI configuration...${NC}"
     # .sequelizerc to point CLI to our config and folders
     cat > .sequelizerc << 'EOF'
@@ -532,6 +536,15 @@ EOF
     ensure_env "JWT_SECRET" "${JWT_SECRET_VALUE:-change-me-jwt}"
     ensure_env "JWT_ACCESS_TTL" "15m"
     ensure_env "JWT_REFRESH_TTL" "7d"
+    ensure_env "PUBLIC_BASE_URL" "http://localhost:${RANDOM_PORT}"
+    ensure_env "CLIENT_ORIGINS" "http://localhost:${RANDOM_PORT}"
+    ensure_env "RATE_LIMIT_WINDOW_MS" "60000"
+    ensure_env "RATE_LIMIT_MAX" "100"
+    ensure_env "SMTP_HOST" ""
+    ensure_env "SMTP_PORT" "587"
+    ensure_env "SMTP_USER" ""
+    ensure_env "SMTP_PASS" ""
+    ensure_env "SMTP_FROM" ""
 
     echo -e "${YELLOW}Auth/RBAC: Adding npm database scripts...${NC}"
     npm pkg set scripts.db:migrate="sequelize-cli db:migrate"
@@ -646,6 +659,14 @@ export class RefreshToken extends Model<InferAttributes<RefreshToken>, InferCrea
   declare expiresAt: Date;
 }
 
+export class PasswordResetToken extends Model<InferAttributes<PasswordResetToken>, InferCreationAttributes<PasswordResetToken>> {
+  declare id: CreationOptional<string>;
+  declare userId: string;
+  declare tokenHash: string;
+  declare expiresAt: Date;
+  declare usedAt: CreationOptional<Date | null>;
+}
+
 User.init({
   id: { type: DataTypes.UUID, defaultValue: DataTypes.UUIDV4, primaryKey: true },
   email: { type: DataTypes.STRING, allowNull: false, unique: true },
@@ -675,6 +696,14 @@ RefreshToken.init({
   expiresAt: { type: DataTypes.DATE, allowNull: false },
 }, { sequelize, modelName: 'RefreshToken', tableName: 'RefreshTokens', timestamps: true });
 
+PasswordResetToken.init({
+  id: { type: DataTypes.UUID, defaultValue: DataTypes.UUIDV4, primaryKey: true },
+  userId: { type: DataTypes.UUID, allowNull: false },
+  tokenHash: { type: DataTypes.STRING, allowNull: false },
+  expiresAt: { type: DataTypes.DATE, allowNull: false },
+  usedAt: { type: DataTypes.DATE, allowNull: true },
+}, { sequelize, modelName: 'PasswordResetToken', tableName: 'PasswordResetTokens', timestamps: true });
+
 // Associations
 User.belongsToMany(Role, { through: 'UserRoles', foreignKey: 'userId' });
 Role.belongsToMany(User, { through: 'UserRoles', foreignKey: 'roleId' });
@@ -684,8 +713,10 @@ Permission.belongsToMany(Role, { through: 'RolePermissions', foreignKey: 'permis
 
 User.hasMany(RefreshToken, { foreignKey: 'userId' });
 RefreshToken.belongsTo(User, { foreignKey: 'userId' });
+User.hasMany(PasswordResetToken, { foreignKey: 'userId' });
+PasswordResetToken.belongsTo(User, { foreignKey: 'userId' });
 
-export default { sequelize, User, Role, Permission, RefreshToken };
+export default { sequelize, User, Role, Permission, RefreshToken, PasswordResetToken };
 EOF
 
     echo -e "${YELLOW}Auth/RBAC: Adding Passport strategies and JWT helpers...${NC}"
@@ -697,10 +728,10 @@ import crypto from 'crypto';
 import { addMs } from './ttl';
 import models from '../models';
 
-export function issueAccessToken(user: any, roles: string[]) {
+export function issueAccessToken(user: any, roles: string[], permissions: string[] = []) {
   const secret: Secret = (process.env.JWT_SECRET as string) || 'change-me';
   const ttl = (process.env.JWT_ACCESS_TTL as string) || '15m';
-  const payload = { sub: user.id, roles };
+  const payload = { sub: user.id, roles, permissions };
   const options: SignOptions = { expiresIn: ttl as any };
   return jwt.sign(payload, secret, options);
 }
@@ -756,7 +787,7 @@ import passport from 'passport';
 import { Strategy as LocalStrategy } from 'passport-local';
 import { Strategy as JwtStrategy, ExtractJwt } from 'passport-jwt';
 import bcrypt from 'bcrypt';
-import models from '../models';
+import models, { Permission, Role, User } from '../models';
 
 passport.serializeUser((user: any, done: (err: any, id?: any) => void) => done(null, user.id));
 passport.deserializeUser(async (id: string, done: (err: any, user?: any) => void) => {
@@ -801,10 +832,36 @@ EOF
     echo -e "${YELLOW}Auth/RBAC: Adding RBAC middleware...${NC}"
     cat > middleware/rbac.ts << 'EOF'
 import { Request, Response, NextFunction } from 'express';
+import models from '../models';
+
+async function getUserRoles(req: Request): Promise<string[]> {
+  const u: any = (req as any).user;
+  if (!u) return [];
+  if (Array.isArray(u.roles) && u.roles.length) return u.roles as string[];
+  if (typeof u.getRoles === 'function') {
+    const rs = await u.getRoles();
+    return rs.map((r: any) => r.name);
+  }
+  return [];
+}
+
+async function getUserPermissions(req: Request): Promise<string[]> {
+  const u: any = (req as any).user;
+  if (!u) return [];
+  if (Array.isArray(u.permissions) && u.permissions.length) return u.permissions as string[];
+  // Session user (Sequelize instance): compute via roles → permissions
+  if (typeof u.getRoles === 'function') {
+    const roles = await u.getRoles();
+    const permsNested = await Promise.all(roles.map((r: any) => r.getPermissions()));
+    const perms = Array.from(new Set(permsNested.flat().map((p: any) => p.name)));
+    return perms;
+  }
+  return [];
+}
 
 export function requireRole(required: string[]) {
-  return (req: Request, res: Response, next: NextFunction) => {
-    const roles: string[] = (req as any).user?.roles || [];
+  return async (req: Request, res: Response, next: NextFunction) => {
+    const roles = await getUserRoles(req);
     if (!required.some(r => roles.includes(r))) {
       return res.status(403).json({ error: 'Forbidden' });
     }
@@ -813,8 +870,8 @@ export function requireRole(required: string[]) {
 }
 
 export function requirePermission(required: string[]) {
-  return (req: Request, res: Response, next: NextFunction) => {
-    const perms: string[] = (req as any).user?.permissions || [];
+  return async (req: Request, res: Response, next: NextFunction) => {
+    const perms = await getUserPermissions(req);
     if (!required.some(p => perms.includes(p))) {
       return res.status(403).json({ error: 'Forbidden' });
     }
@@ -827,6 +884,7 @@ EOF
     cat > routes/auth.web.ts << 'EOF'
 import express from 'express';
 import passport from '../auth/passport';
+import models from '../models';
 
 const router = express.Router();
 
@@ -842,12 +900,13 @@ router.post('/logout', (req, res, next) => {
   });
 });
 
-router.get('/me', (req, res) => {
+router.get('/me', async (req, res) => {
   if (!(req as any).isAuthenticated || !(req as any).isAuthenticated()) {
     return res.status(401).json({ error: 'Unauthorized' });
   }
-  const user = (req as any).user;
-  res.json({ id: user.id, email: user.email });
+  const user: any = (req as any).user;
+  const roles = await user.getRoles().then((rs: any[]) => rs.map(r => r.name));
+  res.json({ id: user.id, email: user.email, roles });
 });
 
 export default router;
@@ -858,14 +917,23 @@ import express from 'express';
 import passport from '../auth/passport';
 import { issueAccessToken, issueRefreshToken, rotateRefreshToken } from '../auth/jwt';
 import models from '../models';
+import { z } from 'zod';
+import { validate } from '../middleware/validate';
+import { sendPasswordReset } from '../services/email';
+import crypto from 'crypto';
+import { addMs } from '../auth/ttl';
 
 const router = express.Router();
 
 router.post('/login', (req, res, next) => {
   passport.authenticate('local', { session: false }, async (err: any, user: any, info: any) => {
     if (err || !user) return res.status(401).json({ error: 'Invalid credentials' });
-    const roles = await user.getRoles().then((rs: any[]) => rs.map(r => r.name));
-    const accessToken = issueAccessToken(user, roles);
+    const roles = await user.getRoles().then((rs: any[]) => rs.map((r: any) => r.name));
+    // collect permissions from roles
+    const roleInstances = await user.getRoles();
+    const permsNested = await Promise.all(roleInstances.map((r: any) => r.getPermissions()));
+    const permissions = Array.from(new Set(permsNested.flat().map((p: any) => p.name)));
+    const accessToken = issueAccessToken(user, roles, permissions);
     const { refreshToken, jti, expiresAt } = await issueRefreshToken(user);
     res.json({ accessToken, refreshToken, jti, expiresAt });
   })(req, res, next);
@@ -885,6 +953,37 @@ router.post('/refresh', async (req, res) => {
 
 router.get('/me', passport.authenticate('jwt', { session: false }), async (req, res) => {
   res.json({ user: (req as any).user });
+});
+
+// Password reset: request
+const requestResetSchema = z.object({ email: z.string().email() });
+router.post('/request-reset', validate(requestResetSchema), async (req, res) => {
+  const { email } = req.body as { email: string };
+  const user = await models.User.findOne({ where: { email } });
+  if (!user) return res.status(200).json({ ok: true }); // do not reveal
+  const rawToken = crypto.randomBytes(32).toString('hex');
+  const tokenHash = crypto.createHash('sha256').update(rawToken).digest('hex');
+  const expiresAt = new Date(Date.now() + addMs('1h'));
+  await models.PasswordResetToken.create({ userId: (user as any).id, tokenHash, expiresAt });
+  await sendPasswordReset(email, rawToken, (user as any).id);
+  return res.json({ ok: true });
+});
+
+// Password reset: consume
+const resetSchema = z.object({ userId: z.string().uuid(), token: z.string(), password: z.string().min(8) });
+router.post('/reset', validate(resetSchema), async (req, res) => {
+  const { userId, token, password } = req.body as { userId: string; token: string; password: string };
+  const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
+  const rec: any = await models.PasswordResetToken.findOne({ where: { userId, tokenHash, usedAt: null } });
+  if (!rec || rec.expiresAt.getTime() < Date.now()) return res.status(400).json({ error: 'Invalid or expired token' });
+  const user: any = await models.User.findByPk(userId);
+  if (!user) return res.status(400).json({ error: 'Invalid user' });
+  const bcrypt = require('bcrypt');
+  user.passwordHash = await bcrypt.hash(password, 12);
+  await user.save();
+  rec.usedAt = new Date();
+  await rec.save();
+  return res.json({ ok: true });
 });
 
 export default router;
@@ -948,6 +1047,16 @@ module.exports = {
       createdAt: { type: Sequelize.DATE, allowNull: false, defaultValue: Sequelize.literal('CURRENT_TIMESTAMP') },
       updatedAt: { type: Sequelize.DATE, allowNull: false, defaultValue: Sequelize.literal('CURRENT_TIMESTAMP') },
     });
+
+    await queryInterface.createTable('PasswordResetTokens', {
+      id: { type: Sequelize.UUID, primaryKey: true, allowNull: false },
+      userId: { type: Sequelize.UUID, allowNull: false },
+      tokenHash: { type: Sequelize.STRING, allowNull: false },
+      expiresAt: { type: Sequelize.DATE, allowNull: false },
+      usedAt: { type: Sequelize.DATE },
+      createdAt: { type: Sequelize.DATE, allowNull: false, defaultValue: Sequelize.literal('CURRENT_TIMESTAMP') },
+      updatedAt: { type: Sequelize.DATE, allowNull: false, defaultValue: Sequelize.literal('CURRENT_TIMESTAMP') },
+    });
   },
 
   async down(queryInterface) {
@@ -957,6 +1066,7 @@ module.exports = {
     await queryInterface.dropTable('Permissions');
     await queryInterface.dropTable('Roles');
     await queryInterface.dropTable('Users');
+    await queryInterface.dropTable('PasswordResetTokens');
   }
 };
 EOF
@@ -1045,10 +1155,14 @@ import sequelize from './db/sequelize';
 import indexRouter from './routes/index';
 import authWeb from './routes/auth.web';
 import authApi from './routes/auth.api';
+import adminUsers from './routes/admin.users';
+import helmet from 'helmet';
+import rateLimit from 'express-rate-limit';
 
 const app = express();
 
-app.use(logger('dev'));
+// Logger (plain in dev, combined in prod)
+app.use(logger(process.env.NODE_ENV === 'production' ? 'combined' : 'dev'));
 app.use(express.json());
 app.use(express.urlencoded({ extended: false }));
 app.use(cookieParser());
@@ -1058,6 +1172,12 @@ app.use(express.static(path.join(__dirname, 'public')));
 
 // Serve React client build files statically from dist/client
 app.use(express.static(path.join(__dirname, 'dist/client')));
+
+// Security
+app.use(helmet());
+const windowMs = parseInt(process.env.RATE_LIMIT_WINDOW_MS || '60000', 10);
+const maxReq = parseInt(process.env.RATE_LIMIT_MAX || '100', 10);
+app.use(['/auth', '/api/auth'], rateLimit({ windowMs, max: maxReq }));
 
 // Sessions (web) with Sequelize store
 const SequelizeStore = require('connect-session-sequelize')(session.Store);
@@ -1075,7 +1195,9 @@ app.use(session({
 }));
 store.sync();
 
-app.use(cors());
+// CORS from env
+const origins = (process.env.CLIENT_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean);
+app.use(cors(origins.length ? { origin: origins, credentials: true } : undefined));
 app.use(passport.initialize());
 app.use(passport.session());
 
@@ -1083,6 +1205,7 @@ app.use(passport.session());
 app.use('/api', indexRouter);
 app.use('/auth', authWeb); // session-based web auth
 app.use('/api/auth', authApi); // JWT-based API auth
+app.use('/api/admin/users', adminUsers);
 
 // Catch-all handler to serve React app for client-side routing
 app.get('*', (req: Request, res: Response) => {
@@ -1103,6 +1226,167 @@ app.use(function(err: any, req: Request, res: Response, next: NextFunction) {
 });
 
 export default app;
+EOF
+
+    echo -e "${YELLOW}Auth/RBAC: Adding validation and email service...${NC}"
+    cat > middleware/validate.ts << 'EOF'
+import type { ZodSchema, ZodError } from 'zod';
+import { Request, Response, NextFunction } from 'express';
+
+// Validates req.body by default. For schemas expecting a different shape,
+// create a wrapper schema or adjust below as needed.
+export function validate(schema: ZodSchema<any>) {
+  return (req: Request, res: Response, next: NextFunction) => {
+    try {
+      schema.parse(req.body);
+      next();
+    } catch (e) {
+      const err = e as ZodError;
+      if (err?.issues) {
+        return res.status(400).json({ error: 'ValidationError', details: err.issues });
+      }
+      next(e);
+    }
+  };
+}
+EOF
+
+    echo -e "${YELLOW}Admin: Adding Users CRUD endpoints...${NC}"
+    cat > routes/admin.users.ts << 'EOF'
+import express from 'express';
+import { z } from 'zod';
+import { validate } from '../middleware/validate';
+import models from '../models';
+import { requirePermission } from '../middleware/rbac';
+import { sendPasswordReset } from '../services/email';
+
+const router = express.Router();
+
+// List users with optional search and pagination
+router.get('/', requirePermission(['users.read']), async (req, res) => {
+  const q = (req.query.q as string) || '';
+  const page = parseInt((req.query.page as string) || '1', 10);
+  const pageSize = parseInt((req.query.pageSize as string) || '10', 10);
+  const offset = (page - 1) * pageSize;
+  const where: any = q
+    ? { email: { [require('sequelize').Op.like]: `%${q}%` } }
+    : {};
+  const { rows, count } = await (models as any).User.findAndCountAll({ where, limit: pageSize, offset, order: [['createdAt', 'DESC']] });
+  res.json({ items: rows, total: count, page, pageSize });
+});
+
+const createSchema = z.object({
+  email: z.string().email(),
+  firstName: z.string().optional(),
+  lastName: z.string().optional(),
+  password: z.string().min(8),
+  roles: z.array(z.string()).default(['user'])
+});
+
+router.post('/', requirePermission(['users.write']), validate(createSchema), async (req, res) => {
+  const { email, firstName, lastName, password, roles } = req.body;
+  const existing = await (models as any).User.findOne({ where: { email } });
+  if (existing) return res.status(409).json({ error: 'Email already exists' });
+  const bcrypt = require('bcrypt');
+  const user = await (models as any).User.create({ email, firstName, lastName, passwordHash: await bcrypt.hash(password, 12) });
+  if (roles?.length) {
+    const roleModels = await (models as any).Role.findAll({ where: { name: roles } });
+    await (user as any).setRoles(roleModels);
+  }
+  res.status(201).json(user);
+});
+
+const updateSchema = z.object({
+  email: z.string().email().optional(),
+  firstName: z.string().optional(),
+  lastName: z.string().optional(),
+  password: z.string().min(8).optional(),
+  roles: z.array(z.string()).optional()
+});
+
+router.put('/:id', requirePermission(['users.write']), validate(updateSchema), async (req, res) => {
+  const { id } = req.params as any;
+  const { email, firstName, lastName, password, roles } = req.body;
+  const user: any = await (models as any).User.findByPk(id);
+  if (!user) return res.status(404).json({ error: 'Not found' });
+  if (email) user.email = email;
+  if (firstName !== undefined) user.firstName = firstName;
+  if (lastName !== undefined) user.lastName = lastName;
+  if (password) {
+    const bcrypt = require('bcrypt');
+    user.passwordHash = await bcrypt.hash(password, 12);
+  }
+  await user.save();
+  if (roles) {
+    const roleModels = await (models as any).Role.findAll({ where: { name: roles } });
+    await user.setRoles(roleModels);
+  }
+  res.json(user);
+});
+
+const statusSchema = z.object({ isActive: z.boolean() });
+router.patch('/:id/status', requirePermission(['users.write']), validate(statusSchema), async (req, res) => {
+  const { id } = req.params as any;
+  const { isActive } = req.body as any;
+  const user: any = await (models as any).User.findByPk(id);
+  if (!user) return res.status(404).json({ error: 'Not found' });
+  user.isActive = isActive;
+  await user.save();
+  res.json(user);
+});
+
+router.delete('/:id', requirePermission(['users.write']), async (req, res) => {
+  const { id } = req.params as any;
+  const user: any = await (models as any).User.findByPk(id);
+  if (!user) return res.status(404).json({ error: 'Not found' });
+  await user.destroy();
+  res.json({ ok: true });
+});
+
+router.post('/:id/reset', requirePermission(['users.write']), async (req, res) => {
+  const { id } = req.params as any;
+  const user: any = await (models as any).User.findByPk(id);
+  if (!user) return res.status(404).json({ error: 'Not found' });
+  const crypto = require('crypto');
+  const { addMs } = require('../auth/ttl');
+  const rawToken = crypto.randomBytes(32).toString('hex');
+  const tokenHash = crypto.createHash('sha256').update(rawToken).digest('hex');
+  const expiresAt = new Date(Date.now() + addMs('1h'));
+  await (models as any).PasswordResetToken.create({ userId: user.id, tokenHash, expiresAt });
+  await sendPasswordReset(user.email, rawToken, user.id);
+  res.json({ ok: true });
+});
+
+export default router;
+EOF
+
+    mkdir -p services
+    cat > services/email.ts << 'EOF'
+import nodemailer from 'nodemailer';
+
+export async function sendPasswordReset(to: string, token: string, userId: string) {
+  const host = process.env.SMTP_HOST;
+  const port = parseInt(process.env.SMTP_PORT || '587', 10);
+  const user = process.env.SMTP_USER;
+  const pass = process.env.SMTP_PASS;
+  const from = process.env.SMTP_FROM || 'no-reply@example.com';
+
+  const base = process.env.PUBLIC_BASE_URL || `http://localhost:${process.env.PORT || '3333'}`;
+  const resetUrl = `${base}/reset?token=${token}&uid=${userId}`;
+
+  if (!host || !user || !pass) {
+    console.log(`[email] SMTP not configured. Share this reset link: ${resetUrl}`);
+    return;
+  }
+
+  const transport = nodemailer.createTransport({ host, port, secure: port === 465, auth: { user, pass } });
+  await transport.sendMail({
+    from,
+    to,
+    subject: 'Password reset',
+    html: `<p>Click to reset your password:</p><p><a href="${resetUrl}">${resetUrl}</a></p>`,
+  });
+}
 EOF
 
     echo -e "${GREEN}✅ Auth/RBAC scaffolding complete (models, strategies, routes, server wiring).${NC}"
@@ -1395,6 +1679,123 @@ npm pkg set scripts.build="BUILD_PATH=../dist/client react-scripts build"
 npm install --save react-router-dom
 npx shadcn@latest add input
 npx shadcn@latest add label
+npx shadcn@latest add dialog
+npx shadcn@latest add https://www.shadcnui-blocks.com/r/table-10.json || true
+
+# Local header component
+mkdir -p src/components
+cat > src/components/AppHeader.tsx << EOF
+import { useEffect, useState } from 'react';
+import { Link, useNavigate, useLocation } from 'react-router-dom';
+import { Button } from './ui/button';
+import { CircleUser } from 'lucide-react';
+
+export default function AppHeader() {
+  const [email, setEmail] = useState<string | null>(null);
+  const [isAdmin, setIsAdmin] = useState(false);
+  const navigate = useNavigate();
+  const location = useLocation();
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const res = await fetch('/auth/me');
+        if (!res.ok) return;
+        const data = await res.json();
+        setEmail(data.email || null);
+        const roles: string[] = data.roles || [];
+        setIsAdmin(roles.includes('admin'));
+      } catch {}
+    })();
+  }, [location.pathname]);
+
+  async function onLogout() {
+    try {
+      await fetch('/auth/logout', { method: 'POST' });
+    } finally {
+      navigate('/');
+    }
+  }
+
+  return (
+    <header className="sticky top-0 z-40 w-full border-b bg-background">
+      <div className="container mx-auto h-14 flex items-center justify-between px-4">
+        <Link to="/home" className="font-semibold">${PROJECT_NAME}</Link>
+        <nav className="flex items-center gap-4">
+          <Button asChild variant="ghost" size="sm"><Link to="/home">Home</Link></Button>
+          {isAdmin && (
+            <Button asChild variant="ghost" size="sm"><Link to="/admin/users">Users</Link></Button>
+          )}
+        </nav>
+        <div className="flex items-center gap-3">
+          {email ? (
+            <>
+              <CircleUser className="w-5 h-5" />
+              <span className="text-sm text-muted-foreground hidden sm:inline">{email}</span>
+              <Button size="sm" variant="outline" onClick={onLogout}>Logout</Button>
+            </>
+          ) : (
+            <Button asChild size="sm"><Link to="/">Login</Link></Button>
+          )}
+        </div>
+      </div>
+    </header>
+  );
+}
+EOF
+
+if [ ! -f src/components/customized/table/table-10.tsx ]; then
+mkdir -p src/components/customized/table
+cat > src/components/customized/table/table-10.tsx << 'EOF'
+import React from 'react';
+
+type Props = {
+  data: any[];
+  columns: { header: string; accessorKey?: string; cell?: (ctx: any) => React.ReactNode }[];
+  total: number;
+  page: number;
+  pageSize: number;
+  onPageChange: (p: number) => void;
+  onPageSizeChange: (s: number) => void;
+};
+
+export default function Table10({ data, columns, total, page, pageSize, onPageChange, onPageSizeChange }: Props) {
+  const totalPages = Math.max(1, Math.ceil(total / pageSize));
+  return (
+    <div className="w-full">
+      <div className="overflow-x-auto border rounded-md">
+        <table className="w-full text-sm">
+          <thead>
+            <tr className="bg-muted/50">
+              {columns.map((c, i) => (<th key={i} className="text-left p-2 font-semibold">{c.header}</th>))}
+            </tr>
+          </thead>
+          <tbody>
+            {data.map((row, ri) => (
+              <tr key={ri} className="border-t">
+                {columns.map((c, ci) => (
+                  <td key={ci} className="p-2">{c.cell ? c.cell({ row: { original: row } }) : (row as any)[c.accessorKey || '']}</td>
+                ))}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      <div className="flex items-center justify-between mt-3">
+        <div>Page {page} of {totalPages} • {total} total</div>
+        <div className="flex items-center gap-2">
+          <button disabled={page<=1} onClick={() => onPageChange(page-1)} className="px-2 py-1 border rounded">Prev</button>
+          <button disabled={page>=totalPages} onClick={() => onPageChange(page+1)} className="px-2 py-1 border rounded">Next</button>
+          <select value={pageSize} onChange={e => onPageSizeChange(parseInt(e.target.value,10))} className="border rounded p-1">
+            {[10,20,50].map(s => <option key={s} value={s}>{s}/page</option>)}
+          </select>
+        </div>
+      </div>
+    </div>
+  );
+}
+EOF
+fi
 
 # Delete App.css and update App.tsx
 rm -f src/App.css
@@ -1402,17 +1803,25 @@ rm -f src/App.css
 cat > src/App.tsx << EOF
 import { Routes, Route, Link } from 'react-router-dom';
 import { Button } from './components/ui/button';
+import AppHeader from './components/AppHeader';
 import Login from './pages/Login';
+import AdminUsers from './pages/AdminUsers';
+import ProtectedRoute from './components/ProtectedRoute';
+import ForgotPassword from './pages/ForgotPassword';
+import ResetPassword from './pages/ResetPassword';
 
 function Home() {
   return (
-    <div className="min-h-screen flex flex-col items-center justify-center p-6">
-      <img src="/favicon.ico" className="w-24 h-24 mb-6" alt="${PROJECT_NAME} logo" />
-      <h1 className="text-4xl font-bold mb-4">${PROJECT_NAME}</h1>
-      <p className="text-muted-foreground mb-6">Full-stack Express TypeScript + React + shadcn/ui</p>
-      <Button asChild>
-        <a href="https://reactjs.org" target="_blank" rel="noopener noreferrer">Learn React</a>
-      </Button>
+    <div className="min-h-screen">
+      <AppHeader />
+      <main className="flex flex-col items-center justify-center p-6">
+        <img src="/favicon.ico" className="w-24 h-24 mb-6" alt="${PROJECT_NAME} logo" />
+        <h1 className="text-4xl font-bold mb-4">${PROJECT_NAME}</h1>
+        <p className="text-muted-foreground mb-6">Full-stack Express TypeScript + React + shadcn/ui</p>
+        <Button asChild>
+          <a href="https://reactjs.org" target="_blank" rel="noopener noreferrer">Learn React</a>
+        </Button>
+      </main>
     </div>
   );
 }
@@ -1422,6 +1831,9 @@ export default function App() {
     <Routes>
       <Route path="/" element={<Login />} />
       <Route path="/home" element={<Home />} />
+      <Route path="/forgot" element={<ForgotPassword />} />
+      <Route path="/reset" element={<ResetPassword />} />
+      <Route path="/admin/users" element={<ProtectedRoute roles={["admin"]}><AdminUsers /></ProtectedRoute>} />
     </Routes>
   );
 }
@@ -1492,12 +1904,278 @@ export default function Login() {
           </div>
           <Button type="submit" className="w-full">Login</Button>
         </form>
+        <div className="mt-3 text-right">
+          <a href="/forgot" className="text-sm text-blue-600 hover:underline">Forgot password?</a>
+        </div>
         {message && <p className="text-sm text-muted-foreground mt-4">{message}</p>}
       </div>
     </div>
   );
 }
 EOF
+
+# Forgot Password page
+cat > src/pages/ForgotPassword.tsx << 'EOF'
+import { useState } from 'react';
+import AppHeader from '../components/AppHeader';
+import { Button } from '../components/ui/button';
+import { Input } from '../components/ui/input';
+import { Label } from '../components/ui/label';
+
+export default function ForgotPassword() {
+  const [email, setEmail] = useState('');
+  const [msg, setMsg] = useState<string | null>(null);
+  async function submit(e: React.FormEvent) {
+    e.preventDefault();
+    setMsg(null);
+    const res = await fetch('/api/auth/request-reset', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email }) });
+    setMsg(res.ok ? 'If the email exists, a reset link was sent or logged.' : 'Request failed');
+  }
+  return (
+    <div className="min-h-screen">
+      <AppHeader />
+      <main className="max-w-md mx-auto p-6">
+        <h1 className="text-2xl font-semibold mb-4">Forgot password</h1>
+        <form className="space-y-4" onSubmit={submit}>
+          <div>
+            <Label htmlFor="email">Email</Label>
+            <Input id="email" value={email} onChange={e => setEmail(e.target.value)} required />
+          </div>
+          <Button type="submit" className="w-full">Send reset link</Button>
+        </form>
+        {msg && <p className="text-sm text-muted-foreground mt-4">{msg}</p>}
+      </main>
+    </div>
+  );
+}
+EOF
+
+# Reset Password page
+cat > src/pages/ResetPassword.tsx << 'EOF'
+import { useState } from 'react';
+import { useSearchParams, useNavigate } from 'react-router-dom';
+import AppHeader from '../components/AppHeader';
+import { Button } from '../components/ui/button';
+import { Input } from '../components/ui/input';
+import { Label } from '../components/ui/label';
+
+export default function ResetPassword() {
+  const [params] = useSearchParams();
+  const [password, setPassword] = useState('');
+  const [msg, setMsg] = useState<string | null>(null);
+  const navigate = useNavigate();
+  const token = params.get('token') || '';
+  const userId = params.get('uid') || '';
+
+  async function submit(e: React.FormEvent) {
+    e.preventDefault();
+    setMsg(null);
+    const res = await fetch('/api/auth/reset', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token, userId, password }) });
+    if (res.ok) {
+      setMsg('Password updated. Redirecting to login...');
+      setTimeout(() => navigate('/'), 1200);
+    } else {
+      setMsg('Reset failed. Link may be invalid or expired.');
+    }
+  }
+
+  return (
+    <div className="min-h-screen">
+      <AppHeader />
+      <main className="max-w-md mx-auto p-6">
+        <h1 className="text-2xl font-semibold mb-4">Reset password</h1>
+        <form className="space-y-4" onSubmit={submit}>
+          <div>
+            <Label htmlFor="password">New password</Label>
+            <Input id="password" type="password" value={password} onChange={e => setPassword(e.target.value)} required />
+          </div>
+          <Button type="submit" className="w-full">Update password</Button>
+        </form>
+        {msg && <p className="text-sm text-muted-foreground mt-4">{msg}</p>}
+      </main>
+    </div>
+  );
+}
+EOF
+
+# Admin Users page (shadcn table integration)
+cat > src/pages/AdminUsers.tsx << 'EOF'
+import { useEffect, useMemo, useState } from 'react';
+import AppHeader from '../components/AppHeader';
+import { Button } from '../components/ui/button';
+import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger } from '../components/ui/dialog';
+import { Input } from '../components/ui/input';
+import { Label } from '../components/ui/label';
+
+type User = { id: string; email: string; firstName?: string; lastName?: string; isActive: boolean; createdAt: string };
+
+export default function AdminUsers() {
+  const [items, setItems] = useState<User[]>([]);
+  const [total, setTotal] = useState(0);
+  const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = useState(10);
+  const [q, setQ] = useState('');
+  const [open, setOpen] = useState(false);
+  const [form, setForm] = useState({ email: '', firstName: '', lastName: '', password: '', roles: 'user' });
+
+  async function load() {
+    const res = await fetch(`/api/admin/users?q=${encodeURIComponent(q)}&page=${page}&pageSize=${pageSize}`);
+    if (res.status === 403) {
+      setItems([]);
+      setTotal(0);
+      return;
+    }
+    const data = await res.json();
+    setItems(data.items || []);
+    setTotal(data.total || 0);
+  }
+
+  useEffect(() => { load(); }, [q, page, pageSize]);
+
+  async function createUser() {
+    const body = { ...form, roles: form.roles.split(',').map(r => r.trim()).filter(Boolean) };
+    const res = await fetch('/api/admin/users', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    if (res.ok) { setOpen(false); setForm({ email: '', firstName: '', lastName: '', password: '', roles: 'user' }); load(); }
+  }
+
+  async function toggleActive(user: User) {
+    await fetch(`/api/admin/users/${user.id}/status`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ isActive: !user.isActive }) });
+    load();
+  }
+
+  async function removeUser(user: User) {
+    await fetch(`/api/admin/users/${user.id}`, { method: 'DELETE' });
+    load();
+  }
+
+  async function resetPassword(user: User) {
+    await fetch(`/api/admin/users/${user.id}/reset`, { method: 'POST' });
+    alert('If SMTP is configured, a reset email was sent; otherwise the link was logged on server.');
+  }
+
+  return (
+    <div className="min-h-screen">
+      <AppHeader />
+      <div className="container mx-auto py-8">
+        <div className="flex items-center justify-between mb-4">
+          <h1 className="text-2xl font-semibold">Users</h1>
+          <Dialog open={open} onOpenChange={setOpen}>
+            <DialogTrigger asChild>
+              <Button>New User</Button>
+            </DialogTrigger>
+            <DialogContent>
+              <DialogHeader>
+                <DialogTitle>Create User</DialogTitle>
+              </DialogHeader>
+              <div className="grid gap-3">
+                <div>
+                  <Label htmlFor="email">Email</Label>
+                  <Input id="email" value={form.email} onChange={e => setForm({ ...form, email: e.target.value })} />
+                </div>
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <Label htmlFor="firstName">First name</Label>
+                    <Input id="firstName" value={form.firstName} onChange={e => setForm({ ...form, firstName: e.target.value })} />
+                  </div>
+                  <div>
+                    <Label htmlFor="lastName">Last name</Label>
+                    <Input id="lastName" value={form.lastName} onChange={e => setForm({ ...form, lastName: e.target.value })} />
+                  </div>
+                </div>
+                <div>
+                  <Label htmlFor="password">Password</Label>
+                  <Input id="password" type="password" value={form.password} onChange={e => setForm({ ...form, password: e.target.value })} />
+                </div>
+                <div>
+                  <Label htmlFor="roles">Roles (comma separated)</Label>
+                  <Input id="roles" value={form.roles} onChange={e => setForm({ ...form, roles: e.target.value })} />
+                </div>
+                <Button onClick={createUser}>Create</Button>
+              </div>
+            </DialogContent>
+          </Dialog>
+        </div>
+        <div className="mb-4">
+          <Input placeholder="Search email..." value={q} onChange={e => { setPage(1); setQ(e.target.value); }} />
+        </div>
+        <div className="overflow-x-auto border rounded-md">
+          <table className="w-full text-sm">
+            <thead>
+              <tr className="bg-muted/50">
+                <th className="text-left p-2 font-semibold">Email</th>
+                <th className="text-left p-2 font-semibold">Name</th>
+                <th className="text-left p-2 font-semibold">Active</th>
+                <th className="text-left p-2 font-semibold">Created</th>
+                <th className="text-left p-2 font-semibold">Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              {items.map((u) => (
+                <tr key={u.id} className="border-t">
+                  <td className="p-2">{u.email}</td>
+                  <td className="p-2">{`${u.firstName || ''} ${u.lastName || ''}`.trim()}</td>
+                  <td className="p-2">{u.isActive ? 'Yes' : 'No'}</td>
+                  <td className="p-2">{new Date(u.createdAt).toLocaleString()}</td>
+                  <td className="p-2">
+                    <div className="flex gap-2">
+                      <Button size="sm" variant="outline" onClick={() => toggleActive(u)}>{u.isActive ? 'Deactivate' : 'Activate'}</Button>
+                      <Button size="sm" variant="destructive" onClick={() => removeUser(u)}>Delete</Button>
+                      <Button size="sm" onClick={() => resetPassword(u)}>Reset</Button>
+                    </div>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+        <div className="flex items-center justify-between mt-3">
+          <div>Page {page} of {Math.max(1, Math.ceil(total / pageSize))} • {total} total</div>
+          <div className="flex items-center gap-2">
+            <button disabled={page<=1} onClick={() => setPage(page-1)} className="px-2 py-1 border rounded">Prev</button>
+            <button disabled={page>=Math.max(1, Math.ceil(total / pageSize))} onClick={() => setPage(page+1)} className="px-2 py-1 border rounded">Next</button>
+            <select value={pageSize} onChange={e => setPageSize(parseInt(e.target.value,10))} className="border rounded p-1">
+              {[10,20,50].map(s => <option key={s} value={s}>{s}/page</option>)}
+            </select>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+EOF
+
+# ProtectedRoute component
+mkdir -p src/components
+cat > src/components/ProtectedRoute.tsx << 'EOF'
+import { ReactNode, useEffect, useState } from 'react';
+import { Navigate } from 'react-router-dom';
+
+type Props = { children: ReactNode; roles?: string[] };
+
+export default function ProtectedRoute({ children, roles }: Props) {
+  const [allowed, setAllowed] = useState<boolean | null>(null);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const res = await fetch('/auth/me');
+        if (!res.ok) return setAllowed(false);
+        const data = await res.json();
+        if (!roles || roles.length === 0) return setAllowed(true);
+        const userRoles: string[] = data.roles || [];
+        setAllowed(roles.some(r => userRoles.includes(r)));
+      } catch {
+        setAllowed(false);
+      }
+    })();
+  }, [roles?.join(',')]);
+
+  if (allowed === null) return <div className="p-4 text-center text-sm text-muted-foreground">Loading...</div>;
+  return allowed ? <>{children}</> : <Navigate to="/" replace />;
+}
+EOF
+
+# AdminLink no longer needed; logic moved into AppHeader
 
 # Step 11: Build client and return to project root
 echo -e "${YELLOW}Step 11: Building React client...${NC}"
