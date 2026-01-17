@@ -1647,7 +1647,28 @@ export function cn(...inputs: ClassValue[]) {
 }
 EOF
 
-# Create components.json for shadcn/ui
+# Install CRACO for path alias support in CRA
+npm install --save-dev @craco/craco
+
+# Create CRACO config for path aliases
+cat > craco.config.js << 'EOF'
+const path = require('path');
+
+module.exports = {
+  webpack: {
+    alias: {
+      '@': path.resolve(__dirname, 'src'),
+    },
+  },
+};
+EOF
+
+# Update package.json scripts to use craco
+npm pkg set scripts.start="craco start"
+npm pkg set scripts.build="BUILD_PATH=../dist/client craco build"
+npm pkg set scripts.test="craco test"
+
+# Create components.json for shadcn/ui with proper @ aliases
 cat > components.json << 'EOF'
 {
   "$schema": "https://ui.shadcn.com/schema.json",
@@ -1662,25 +1683,62 @@ cat > components.json << 'EOF'
     "prefix": ""
   },
   "aliases": {
-    "components": "src/components",
-    "utils": "src/lib/utils"
+    "components": "@/components",
+    "ui": "@/components/ui",
+    "utils": "@/lib/utils",
+    "lib": "@/lib",
+    "hooks": "@/hooks"
   }
 }
 EOF
 
-# Add shadcn/ui button component
-npx shadcn@latest add button
+# Add shadcn/ui button component (--yes for non-interactive)
+npx shadcn@latest add button --yes
 
-# Update React build output directory to dist/client
+# Update React homepage for relative paths
 npm pkg set homepage="."
-npm pkg set scripts.build="BUILD_PATH=../dist/client react-scripts build"
 
 # Install client routing and add shadcn inputs
 npm install --save react-router-dom
-npx shadcn@latest add input
-npx shadcn@latest add label
-npx shadcn@latest add dialog
-npx shadcn@latest add https://www.shadcnui-blocks.com/r/table-10.json || true
+npx shadcn@latest add input --yes
+npx shadcn@latest add label --yes
+npx shadcn@latest add dialog --yes
+npx shadcn@latest add checkbox --yes || true
+npx shadcn@latest add dropdown-menu --yes || true
+npx shadcn@latest add select --yes || true
+npx shadcn@latest add table --yes || true
+npx shadcn@latest add badge --yes || true
+npx shadcn@latest add popover --yes || true
+npx shadcn@latest add command --yes || true
+npx shadcn@latest add separator --yes || true
+npx shadcn@latest add https://www.shadcnui-blocks.com/r/table-10.json --yes || true
+
+# Fix any incorrect component imports from third-party components
+echo -e "${YELLOW}Fixing import paths in generated components...${NC}"
+find src/components -name "*.tsx" -o -name "*.ts" 2>/dev/null | while read file; do
+    if [ -f "$file" ]; then
+        # Replace src/components/* imports with @/components/ui/*
+        sed -i '' 's|from "src/components/|from "@/components/ui/|g' "$file"
+        sed -i '' "s|from 'src/components/|from '@/components/ui/|g" "$file"
+        # Replace @/components/* (without ui) with @/components/ui/* for known shadcn components
+        # But avoid double-replacing @/components/ui/
+        sed -i '' 's|from "@/components/button"|from "@/components/ui/button"|g' "$file"
+        sed -i '' 's|from "@/components/input"|from "@/components/ui/input"|g' "$file"
+        sed -i '' 's|from "@/components/label"|from "@/components/ui/label"|g' "$file"
+        sed -i '' 's|from "@/components/checkbox"|from "@/components/ui/checkbox"|g' "$file"
+        sed -i '' 's|from "@/components/dialog"|from "@/components/ui/dialog"|g' "$file"
+        sed -i '' 's|from "@/components/dropdown-menu"|from "@/components/ui/dropdown-menu"|g' "$file"
+        sed -i '' 's|from "@/components/select"|from "@/components/ui/select"|g' "$file"
+        sed -i '' 's|from "@/components/table"|from "@/components/ui/table"|g' "$file"
+        sed -i '' 's|from "@/components/badge"|from "@/components/ui/badge"|g' "$file"
+        sed -i '' 's|from "@/components/popover"|from "@/components/ui/popover"|g' "$file"
+        sed -i '' 's|from "@/components/command"|from "@/components/ui/command"|g' "$file"
+        sed -i '' 's|from "@/components/separator"|from "@/components/ui/separator"|g' "$file"
+        # Replace src/lib/* imports with @/lib/*
+        sed -i '' 's|from "src/lib/|from "@/lib/|g' "$file"
+        sed -i '' "s|from 'src/lib/|from '@/lib/|g" "$file"
+    fi
+done
 
 # Local header component
 mkdir -p src/components
