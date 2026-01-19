@@ -300,7 +300,7 @@ app.use(express.static(path.join(__dirname, 'public')));
 
 // Step 8: Add code to statically serve the client frontend
 // Serve React client build files statically from dist/client - this ensures the client is served from Express
-app.use(express.static(path.join(__dirname, 'dist/client')));
+app.use(express.static(path.join(__dirname, 'client')));
 
 // API routes (if any) should be defined before the catch-all
 app.use('/api', indexRouter);
@@ -308,7 +308,7 @@ app.use('/api', indexRouter);
 // Step 9: Catch-all handler to serve React app for client-side routing
 // This ensures the client never runs its own server - everything goes through Express
 app.get('*', (req: Request, res: Response) => {
-  res.sendFile(path.join(__dirname, 'dist/client', 'index.html'));
+  res.sendFile(path.join(__dirname, 'client', 'index.html'));
 });
 
 // catch 404 and forward to error handler
@@ -1171,7 +1171,7 @@ app.use(cookieParser());
 app.use(express.static(path.join(__dirname, 'public')));
 
 // Serve React client build files statically from dist/client
-app.use(express.static(path.join(__dirname, 'dist/client')));
+app.use(express.static(path.join(__dirname, 'client')));
 
 // Security
 app.use(helmet());
@@ -1209,7 +1209,7 @@ app.use('/api/admin/users', adminUsers);
 
 // Catch-all handler to serve React app for client-side routing
 app.get('*', (req: Request, res: Response) => {
-  res.sendFile(path.join(__dirname, 'dist/client', 'index.html'));
+  res.sendFile(path.join(__dirname, 'client', 'index.html'));
 });
 
 // 404 handler
@@ -1859,7 +1859,8 @@ fi
 rm -f src/App.css
 
 cat > src/App.tsx << EOF
-import { Routes, Route, Link } from 'react-router-dom';
+import React from 'react';
+import { Routes, Route, Link, Navigate } from 'react-router-dom';
 import { Button } from './components/ui/button';
 import AppHeader from './components/AppHeader';
 import Login from './pages/Login';
@@ -1884,10 +1885,26 @@ function Home() {
   );
 }
 
+function AuthOrLogin() {
+  const [isAuthed, setIsAuthed] = React.useState<boolean | null>(null);
+  React.useEffect(() => {
+    (async () => {
+      try {
+        const res = await fetch('/auth/me');
+        setIsAuthed(res.ok);
+      } catch {
+        setIsAuthed(false);
+      }
+    })();
+  }, []);
+  if (isAuthed === null) return <div className="p-4 text-center text-sm text-muted-foreground">Loading...</div>;
+  return isAuthed ? <Navigate to="/home" replace /> : <Login />;
+}
+
 export default function App() {
   return (
     <Routes>
-      <Route path="/" element={<Login />} />
+      <Route path="/" element={<AuthOrLogin />} />
       <Route path="/home" element={<Home />} />
       <Route path="/forgot" element={<ForgotPassword />} />
       <Route path="/reset" element={<ResetPassword />} />
