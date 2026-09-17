@@ -561,8 +561,9 @@ EOF
     ensure_env "JWT_SECRET" "${JWT_SECRET_VALUE}"
     ensure_env "JWT_ACCESS_TTL" "15m"
     ensure_env "JWT_REFRESH_TTL" "7d"
-    ensure_env "PUBLIC_BASE_URL" "http://localhost:${RANDOM_PORT}"
-    ensure_env "CLIENT_ORIGINS" "http://localhost:${RANDOM_PORT}"
+    ensure_env "APP_BASE_URL" "http://localhost:${CLIENT_DEV_PORT}"
+    ensure_env "PUBLIC_BASE_URL" "http://localhost:${CLIENT_DEV_PORT}"
+    ensure_env "CLIENT_ORIGINS" "http://localhost:${CLIENT_DEV_PORT},http://localhost:${RANDOM_PORT}"
     ensure_env "RATE_LIMIT_WINDOW_MS" "60000"
     ensure_env "RATE_LIMIT_MAX" "100"
     ensure_env "SMTP_HOST" ""
@@ -663,6 +664,7 @@ export class User extends Model<InferAttributes<User>, InferCreationAttributes<U
   declare lastName: CreationOptional<string | null>;
   declare isActive: CreationOptional<boolean>;
   declare lastLoginAt: CreationOptional<Date | null>;
+  declare inviteAcceptedAt: CreationOptional<Date | null>;
 }
 
 export class Role extends Model<InferAttributes<Role>, InferCreationAttributes<Role>> {
@@ -692,6 +694,15 @@ export class PasswordResetToken extends Model<InferAttributes<PasswordResetToken
   declare usedAt: CreationOptional<Date | null>;
 }
 
+export class InviteToken extends Model<InferAttributes<InviteToken>, InferCreationAttributes<InviteToken>> {
+  declare id: CreationOptional<string>;
+  declare userId: string;
+  declare tokenHash: string;
+  declare expiresAt: Date;
+  declare usedAt: CreationOptional<Date | null>;
+  declare revokedAt: CreationOptional<Date | null>;
+}
+
 User.init({
   id: { type: DataTypes.UUID, defaultValue: DataTypes.UUIDV4, primaryKey: true },
   email: { type: DataTypes.STRING, allowNull: false, unique: true },
@@ -700,6 +711,7 @@ User.init({
   lastName: { type: DataTypes.STRING, allowNull: true },
   isActive: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: true },
   lastLoginAt: { type: DataTypes.DATE, allowNull: true },
+  inviteAcceptedAt: { type: DataTypes.DATE, allowNull: true },
 }, { sequelize, modelName: 'User', tableName: 'Users', timestamps: true });
 
 Role.init({
@@ -729,6 +741,15 @@ PasswordResetToken.init({
   usedAt: { type: DataTypes.DATE, allowNull: true },
 }, { sequelize, modelName: 'PasswordResetToken', tableName: 'PasswordResetTokens', timestamps: true });
 
+InviteToken.init({
+  id: { type: DataTypes.UUID, defaultValue: DataTypes.UUIDV4, primaryKey: true },
+  userId: { type: DataTypes.UUID, allowNull: false },
+  tokenHash: { type: DataTypes.STRING, allowNull: false },
+  expiresAt: { type: DataTypes.DATE, allowNull: false },
+  usedAt: { type: DataTypes.DATE, allowNull: true },
+  revokedAt: { type: DataTypes.DATE, allowNull: true },
+}, { sequelize, modelName: 'InviteToken', tableName: 'InviteTokens', timestamps: true });
+
 // Associations
 User.belongsToMany(Role, { through: 'UserRoles', foreignKey: 'userId' });
 Role.belongsToMany(User, { through: 'UserRoles', foreignKey: 'roleId' });
@@ -740,13 +761,134 @@ User.hasMany(RefreshToken, { foreignKey: 'userId' });
 RefreshToken.belongsTo(User, { foreignKey: 'userId' });
 User.hasMany(PasswordResetToken, { foreignKey: 'userId' });
 PasswordResetToken.belongsTo(User, { foreignKey: 'userId' });
+User.hasMany(InviteToken, { foreignKey: 'userId' });
+InviteToken.belongsTo(User, { foreignKey: 'userId' });
 
-export default { sequelize, User, Role, Permission, RefreshToken, PasswordResetToken };
+export default { sequelize, User, Role, Permission, RefreshToken, PasswordResetToken, InviteToken };
+
 EOF
 
     echo -e "${YELLOW}Auth/RBAC: Adding Passport strategies and JWT helpers...${NC}"
 
     # JWT helpers
+    cat > auth/access.ts << 'EOF'
+type Named = { name: string };
+
+type RoleWithPermissions = Named & {
+  getPermissions: () => Promise<Named[]>;
+};
+
+export async function accessFromSequelizeUser(user: {
+  getRoles: () => Promise<RoleWithPermissions[]>;
+}): Promise<{ roles: string[]; permissions: string[] }> {
+  const roleRows = await user.getRoles();
+  const roles = roleRows.map((role) => role.name);
+  const permissionLists = await Promise.all(roleRows.map((role) => role.getPermissions()));
+  const permissions = Array.from(new Set(permissionLists.flat().map((permission) => permission.name)));
+  return { roles, permissions };
+}
+EOF
+
+    cat > auth/invite.ts << 'EOF'
+import crypto from 'crypto';
+import type { Request } from 'express';
+import models from '../models';
+import { addMs } from './ttl';
+
+export const INVITE_TTL = '3d';
+
+export function hashInviteToken(rawToken: string): string {
+  return crypto.createHash('sha256').update(rawToken).digest('hex');
+}
+
+function trimOrigin(origin: string): string {
+  return origin.trim().replace(/\/$/, '');
+}
+
+function isApiOrigin(origin: string): boolean {
+  const apiPort = process.env.PORT;
+  if (!apiPort) return false;
+  try {
+    return new URL(origin).port === String(apiPort);
+  } catch {
+    return false;
+  }
+}
+
+export function clientAppOrigin(req?: Request): string {
+  const configured = process.env.APP_BASE_URL;
+  if (configured && configured.trim()) return trimOrigin(configured);
+
+  if (req) {
+    const origin = req.get('origin');
+    if (origin && origin.trim() && !isApiOrigin(origin)) return trimOrigin(origin);
+  }
+
+  const clientOrigins = (process.env.CLIENT_ORIGINS || '').split(',').map((item) => item.trim()).filter(Boolean);
+  const browserOrigin = clientOrigins.find((item) => !isApiOrigin(item));
+  if (browserOrigin) return trimOrigin(browserOrigin);
+
+  const apiPort = process.env.PORT;
+  if (process.env.NODE_ENV !== 'production' && apiPort) {
+    return `http://localhost:${Number(apiPort) + 1}`;
+  }
+
+  const publicBase = process.env.PUBLIC_BASE_URL;
+  if (publicBase && publicBase.trim() && !isApiOrigin(publicBase)) return trimOrigin(publicBase);
+  if (publicBase && publicBase.trim()) return trimOrigin(publicBase);
+  return `http://localhost:${apiPort || '3333'}`;
+}
+
+export function appOriginFromRequest(req: Request): string {
+  return clientAppOrigin(req);
+}
+
+export function invitePath(userId: string, token: string): string {
+  return `/invite?${new URLSearchParams({ token, uid: userId }).toString()}`;
+}
+
+export function inviteUrl(origin: string, userId: string, token: string): string {
+  return `${trimOrigin(origin)}${invitePath(userId, token)}`;
+}
+
+export async function revokeOpenInvites(userId: string): Promise<void> {
+  await models.InviteToken.update(
+    { revokedAt: new Date() },
+    { where: { userId, usedAt: null, revokedAt: null } },
+  );
+}
+
+export async function issueInvite(userId: string): Promise<{ token: string; expiresAt: Date }> {
+  const ttlMs = addMs(INVITE_TTL);
+  if (ttlMs <= 0) {
+    throw new Error(`Invalid invite TTL: ${INVITE_TTL}`);
+  }
+  await revokeOpenInvites(userId);
+  const token = crypto.randomBytes(32).toString('hex');
+  const expiresAt = new Date(Date.now() + ttlMs);
+  await models.InviteToken.create({
+    userId,
+    tokenHash: hashInviteToken(token),
+    expiresAt,
+  });
+  return { token, expiresAt };
+}
+
+export async function findOpenInvite(userId: string, token: string) {
+  const rec = await models.InviteToken.findOne({
+    where: {
+      userId,
+      tokenHash: hashInviteToken(token),
+      usedAt: null,
+      revokedAt: null,
+    },
+  });
+  if (!rec || rec.expiresAt.getTime() < Date.now()) return null;
+  return rec;
+}
+
+EOF
+
     cat > auth/jwt.ts << 'EOF'
 import jwt, { SignOptions, Secret } from 'jsonwebtoken';
 import crypto from 'crypto';
@@ -919,7 +1061,7 @@ EOF
     cat > routes/auth.web.ts << 'EOF'
 import express from 'express';
 import passport from '../auth/passport';
-import models from '../models';
+import { accessFromSequelizeUser } from '../auth/access';
 
 const router = express.Router();
 
@@ -939,9 +1081,12 @@ router.get('/me', async (req, res) => {
   if (!(req as any).isAuthenticated || !(req as any).isAuthenticated()) {
     return res.status(401).json({ error: 'Unauthorized' });
   }
-  const user: any = (req as any).user;
-  const roles = await user.getRoles().then((rs: any[]) => rs.map(r => r.name));
-  res.json({ id: user.id, email: user.email, roles });
+  const user = (req as any).user;
+  if (!user || typeof user.getRoles !== 'function') {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  const access = await accessFromSequelizeUser(user);
+  res.json({ id: user.id, email: user.email, roles: access.roles, permissions: access.permissions });
 });
 
 export default router;
@@ -951,23 +1096,22 @@ EOF
 import express from 'express';
 import passport from '../auth/passport';
 import { issueAccessToken, issueRefreshToken, rotateRefreshToken } from '../auth/jwt';
+import { accessFromSequelizeUser } from '../auth/access';
 import models from '../models';
 import { z } from 'zod';
 import { validate } from '../middleware/validate';
 import { sendPasswordReset } from '../services/email';
 import crypto from 'crypto';
+import bcrypt from 'bcrypt';
 import { addMs } from '../auth/ttl';
+import { findOpenInvite } from '../auth/invite';
 
 const router = express.Router();
 
 router.post('/login', (req, res, next) => {
   passport.authenticate('local', { session: false }, async (err: any, user: any, info: any) => {
     if (err || !user) return res.status(401).json({ error: 'Invalid credentials' });
-    const roles = await user.getRoles().then((rs: any[]) => rs.map((r: any) => r.name));
-    // collect permissions from roles
-    const roleInstances = await user.getRoles();
-    const permsNested = await Promise.all(roleInstances.map((r: any) => r.getPermissions()));
-    const permissions = Array.from(new Set(permsNested.flat().map((p: any) => p.name)));
+    const { roles, permissions } = await accessFromSequelizeUser(user);
     const accessToken = issueAccessToken(user, roles, permissions);
     const { refreshToken, jti, expiresAt } = await issueRefreshToken(user);
     res.json({ accessToken, refreshToken, jti, expiresAt });
@@ -981,8 +1125,13 @@ router.post('/refresh', async (req, res) => {
   if (!rotated) return res.status(401).json({ error: 'Invalid refresh token' });
   const user = await models.User.findByPk(userId);
   if (!user) return res.status(401).json({ error: 'Invalid user' });
-  const roles = await (user as any).getRoles().then((rs: any[]) => rs.map(r => r.name));
-  const accessToken = issueAccessToken(user, roles);
+  if (typeof (user as unknown as { getRoles?: unknown }).getRoles !== 'function') {
+    return res.status(401).json({ error: 'Invalid user' });
+  }
+  const { roles, permissions } = await accessFromSequelizeUser(
+    user as unknown as { getRoles: () => Promise<Array<{ name: string; getPermissions: () => Promise<Array<{ name: string }>> }>> },
+  );
+  const accessToken = issueAccessToken(user, roles, permissions);
   res.json({ accessToken, refreshToken: rotated.refreshToken, jti: rotated.jti, expiresAt: rotated.expiresAt });
 });
 
@@ -1013,7 +1162,6 @@ router.post('/reset', validate(resetSchema), async (req, res) => {
   if (!rec || rec.expiresAt.getTime() < Date.now()) return res.status(400).json({ error: 'Invalid or expired token' });
   const user: any = await models.User.findByPk(userId);
   if (!user) return res.status(400).json({ error: 'Invalid user' });
-  const bcrypt = require('bcrypt');
   user.passwordHash = await bcrypt.hash(password, 12);
   await user.save();
   rec.usedAt = new Date();
@@ -1021,7 +1169,48 @@ router.post('/reset', validate(resetSchema), async (req, res) => {
   return res.json({ ok: true });
 });
 
+const inviteQuerySchema = z.object({
+  uid: z.string().uuid(),
+  token: z.string().min(1),
+});
+
+router.get('/invite', async (req, res) => {
+  const parsed = inviteQuerySchema.safeParse(req.query);
+  if (!parsed.success) return res.status(400).json({ error: 'Invalid invite link' });
+  const invite = await findOpenInvite(parsed.data.uid, parsed.data.token);
+  if (!invite) return res.status(400).json({ error: 'Invalid or expired invite' });
+  const user = await models.User.findByPk(parsed.data.uid);
+  if (!user || user.isActive || user.inviteAcceptedAt) {
+    return res.status(400).json({ error: 'Invalid or expired invite' });
+  }
+  res.json({ email: user.email, firstName: user.firstName, lastName: user.lastName });
+});
+
+const acceptInviteSchema = z.object({
+  userId: z.string().uuid(),
+  token: z.string().min(1),
+  password: z.string().min(8),
+});
+
+router.post('/invite', validate(acceptInviteSchema), async (req, res) => {
+  const { userId, token, password } = req.body as { userId: string; token: string; password: string };
+  const invite = await findOpenInvite(userId, token);
+  if (!invite) return res.status(400).json({ error: 'Invalid or expired invite' });
+  const user = await models.User.findByPk(userId);
+  if (!user || user.isActive || user.inviteAcceptedAt) {
+    return res.status(400).json({ error: 'Invalid or expired invite' });
+  }
+  user.passwordHash = await bcrypt.hash(password, 12);
+  user.isActive = true;
+  user.inviteAcceptedAt = new Date();
+  await user.save();
+  invite.usedAt = new Date();
+  await invite.save();
+  return res.json({ ok: true });
+});
+
 export default router;
+
 EOF
 
     echo -e "${YELLOW}Auth/RBAC: Creating initial migration and seeders...${NC}"
@@ -1103,6 +1292,35 @@ module.exports = {
     await queryInterface.dropTable('Users');
     await queryInterface.dropTable('PasswordResetTokens');
   }
+};
+EOF
+
+    cat > db/migrations/20260917220000-invite-tokens.js << 'EOF'
+'use strict';
+
+module.exports = {
+  async up(queryInterface, Sequelize) {
+    await queryInterface.addColumn('Users', 'inviteAcceptedAt', {
+      type: Sequelize.DATE,
+      allowNull: true,
+    });
+
+    await queryInterface.createTable('InviteTokens', {
+      id: { type: Sequelize.UUID, primaryKey: true, allowNull: false },
+      userId: { type: Sequelize.UUID, allowNull: false },
+      tokenHash: { type: Sequelize.STRING, allowNull: false },
+      expiresAt: { type: Sequelize.DATE, allowNull: false },
+      usedAt: { type: Sequelize.DATE },
+      revokedAt: { type: Sequelize.DATE },
+      createdAt: { type: Sequelize.DATE, allowNull: false, defaultValue: Sequelize.literal('CURRENT_TIMESTAMP') },
+      updatedAt: { type: Sequelize.DATE, allowNull: false, defaultValue: Sequelize.literal('CURRENT_TIMESTAMP') },
+    });
+  },
+
+  async down(queryInterface) {
+    await queryInterface.dropTable('InviteTokens');
+    await queryInterface.removeColumn('Users', 'inviteAcceptedAt');
+  },
 };
 EOF
 
@@ -1192,10 +1410,16 @@ import indexRouter from './routes/index';
 import authWeb from './routes/auth.web';
 import authApi from './routes/auth.api';
 import adminUsers from './routes/admin.users';
+import adminRoles from './routes/admin.roles';
+import { clientAppOrigin } from './auth/invite';
 import helmet from 'helmet';
 import rateLimit from 'express-rate-limit';
 
 const app = express();
+
+// CRA's package.json proxy and production reverse proxies send X-Forwarded-For.
+// Trust exactly one hop so express-rate-limit can identify clients by IP.
+app.set('trust proxy', 1);
 
 // Determine if running from source (ts-node) or compiled (dist/)
 // When running with ts-node, __dirname is the project root where app.ts exists
@@ -1232,9 +1456,6 @@ const SESSION_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 const SequelizeStore = require('connect-session-sequelize')(session.Store);
 const store = new SequelizeStore({ db: sequelize });
 const isProduction = process.env.NODE_ENV === 'production';
-if (isProduction) {
-  app.set('trust proxy', 1);
-}
 app.use(session({
   secret: sessionSecret,
   resave: false,
@@ -1259,10 +1480,18 @@ app.use('/api', indexRouter);
 app.use('/auth', authWeb); // session-based web auth
 app.use('/api/auth', authApi); // JWT-based API auth
 app.use('/api/admin/users', adminUsers);
+app.use('/api/admin/roles', adminRoles);
 
 // Catch-all handler to serve React app for client-side routing
-app.get('*', (req: Request, res: Response) => {
-  res.sendFile(path.join(clientPath, 'index.html'));
+app.get('*', (req: Request, res: Response, next: NextFunction) => {
+  if (process.env.NODE_ENV !== 'production') {
+    return res.redirect(302, `${clientAppOrigin()}${req.originalUrl}`);
+  }
+  const indexHtml = path.join(clientPath, 'index.html');
+  if (!fs.existsSync(indexHtml)) {
+    return next(createError(404));
+  }
+  res.sendFile(indexHtml);
 });
 
 // 404 handler
@@ -1306,12 +1535,16 @@ EOF
 
     echo -e "${YELLOW}Admin: Adding Users CRUD endpoints...${NC}"
     cat > routes/admin.users.ts << 'EOF'
+import crypto from 'crypto';
+import bcrypt from 'bcrypt';
 import express from 'express';
 import { z } from 'zod';
 import { validate } from '../middleware/validate';
 import models from '../models';
 import { requirePermission } from '../middleware/rbac';
 import { sendPasswordReset } from '../services/email';
+import { addMs } from '../auth/ttl';
+import { appOriginFromRequest, inviteUrl, issueInvite } from '../auth/invite';
 
 const router = express.Router();
 
@@ -1324,29 +1557,84 @@ router.get('/', requirePermission(['users.read']), async (req, res) => {
   const where: any = q
     ? { email: { [require('sequelize').Op.like]: `%${q}%` } }
     : {};
-  const { rows, count } = await (models as any).User.findAndCountAll({ where, limit: pageSize, offset, order: [['createdAt', 'DESC']] });
-  res.json({ items: rows, total: count, page, pageSize });
+  const [{ rows, count }, roleRows] = await Promise.all([
+    models.User.findAndCountAll({
+      where,
+      include: [{ model: models.Role, attributes: ['name'], through: { attributes: [] } }],
+      limit: pageSize,
+      offset,
+      order: [['createdAt', 'DESC']],
+      distinct: true,
+    }),
+    models.Role.findAll({ attributes: ['name'], order: [['name', 'ASC']] }),
+  ]);
+  const items = rows.map((row) => {
+    const json = row.toJSON() as unknown as {
+      id: string;
+      email: string;
+      firstName?: string | null;
+      lastName?: string | null;
+      isActive: boolean;
+      lastLoginAt?: string | Date | null;
+      inviteAcceptedAt?: string | Date | null;
+      createdAt: string | Date;
+      Roles?: Array<{ name: string }>;
+    };
+    return {
+      id: json.id,
+      email: json.email,
+      firstName: json.firstName,
+      lastName: json.lastName,
+      isActive: json.isActive,
+      lastLoginAt: json.lastLoginAt ?? null,
+      inviteAcceptedAt: json.inviteAcceptedAt ?? null,
+      createdAt: json.createdAt,
+      roles: (json.Roles ?? []).map((role) => role.name),
+    };
+  });
+  res.json({
+    items,
+    total: count,
+    page,
+    pageSize,
+    roleOptions: roleRows.map((role) => role.name),
+  });
 });
 
 const createSchema = z.object({
   email: z.string().email(),
   firstName: z.string().optional(),
   lastName: z.string().optional(),
-  password: z.string().min(8),
-  roles: z.array(z.string()).default(['user'])
+  roles: z.array(z.string()).min(1)
 });
 
 router.post('/', requirePermission(['users.write']), validate(createSchema), async (req, res) => {
-  const { email, firstName, lastName, password, roles } = req.body;
-  const existing = await (models as any).User.findOne({ where: { email } });
+  const email = String(req.body.email).trim().toLowerCase();
+  const firstName = typeof req.body.firstName === 'string' && req.body.firstName.trim() ? req.body.firstName.trim() : null;
+  const lastName = typeof req.body.lastName === 'string' && req.body.lastName.trim() ? req.body.lastName.trim() : null;
+  const roles = req.body.roles as string[];
+  const existing = await models.User.findOne({ where: { email } });
   if (existing) return res.status(409).json({ error: 'Email already exists' });
-  const bcrypt = require('bcrypt');
-  const user = await (models as any).User.create({ email, firstName, lastName, passwordHash: await bcrypt.hash(password, 12) });
-  if (roles?.length) {
-    const roleModels = await (models as any).Role.findAll({ where: { name: roles } });
-    await (user as any).setRoles(roleModels);
+  const roleModels = await models.Role.findAll({ where: { name: roles } });
+  if (roleModels.length !== roles.length) return res.status(400).json({ error: 'Unknown role' });
+  const passwordHash = await bcrypt.hash(crypto.randomBytes(32).toString('hex'), 12);
+  const user = await models.User.create({ email, firstName, lastName, passwordHash, isActive: false });
+  if (typeof (user as unknown as { setRoles?: unknown }).setRoles !== 'function') {
+    return res.status(500).json({ error: 'Unable to assign roles' });
   }
-  res.status(201).json(user);
+  await (user as unknown as { setRoles: (roles: typeof roleModels) => Promise<void> }).setRoles(roleModels);
+  const issued = await issueInvite(user.id);
+  const origin = appOriginFromRequest(req);
+  res.status(201).json({
+    id: user.id,
+    email: user.email,
+    firstName: user.firstName,
+    lastName: user.lastName,
+    isActive: user.isActive,
+    roles,
+    inviteUrl: inviteUrl(origin, user.id, issued.token),
+    expiresAt: issued.expiresAt,
+  });
 });
 
 const updateSchema = z.object({
@@ -1366,7 +1654,6 @@ router.put('/:id', requirePermission(['users.write']), validate(updateSchema), a
   if (firstName !== undefined) user.firstName = firstName;
   if (lastName !== undefined) user.lastName = lastName;
   if (password) {
-    const bcrypt = require('bcrypt');
     user.passwordHash = await bcrypt.hash(password, 12);
   }
   await user.save();
@@ -1396,18 +1683,205 @@ router.delete('/:id', requirePermission(['users.write']), async (req, res) => {
   res.json({ ok: true });
 });
 
-router.post('/:id/reset', requirePermission(['users.write']), async (req, res) => {
-  const { id } = req.params as any;
-  const user: any = await (models as any).User.findByPk(id);
+router.post('/:id/invite', requirePermission(['users.write']), async (req, res) => {
+  const id = typeof req.params.id === 'string' ? req.params.id : '';
+  if (!id) return res.status(400).json({ error: 'Missing user id' });
+  const user = await models.User.findByPk(id);
   if (!user) return res.status(404).json({ error: 'Not found' });
-  const crypto = require('crypto');
-  const { addMs } = require('../auth/ttl');
+  if (user.isActive) return res.status(409).json({ error: 'User already accepted an invite' });
+  const issued = await issueInvite(user.id);
+  res.json({
+    id: user.id,
+    email: user.email,
+    inviteUrl: inviteUrl(appOriginFromRequest(req), user.id, issued.token),
+    expiresAt: issued.expiresAt,
+  });
+});
+
+router.post('/:id/reset', requirePermission(['users.write']), async (req, res) => {
+  const id = typeof req.params.id === 'string' ? req.params.id : '';
+  if (!id) return res.status(400).json({ error: 'Missing user id' });
+  const user = await models.User.findByPk(id);
+  if (!user) return res.status(404).json({ error: 'Not found' });
   const rawToken = crypto.randomBytes(32).toString('hex');
   const tokenHash = crypto.createHash('sha256').update(rawToken).digest('hex');
   const expiresAt = new Date(Date.now() + addMs('1h'));
-  await (models as any).PasswordResetToken.create({ userId: user.id, tokenHash, expiresAt });
+  await models.PasswordResetToken.create({ userId: user.id, tokenHash, expiresAt });
   await sendPasswordReset(user.email, rawToken, user.id);
   res.json({ ok: true });
+});
+
+export default router;
+
+EOF
+
+    cat > routes/admin.roles.ts << 'EOF'
+import express, { Request, Response } from 'express';
+import { UniqueConstraintError } from 'sequelize';
+import { z } from 'zod';
+import { validate } from '../middleware/validate';
+import { requirePermission } from '../middleware/rbac';
+import models from '../models';
+
+const router = express.Router();
+
+const roleNameSchema = z.string().trim().min(1).max(64);
+const roleBodySchema = z.object({
+  name: roleNameSchema,
+  permissions: z.array(z.string().trim().min(1)).default([]),
+});
+
+type RoleJson = {
+  id: string;
+  name: string;
+  permissions: string[];
+  userCount: number;
+};
+
+type RolePermissionWriter = {
+  setPermissions: (permissions: InstanceType<typeof models.Permission>[]) => Promise<void>;
+};
+
+function asRolePermissionWriter(role: InstanceType<typeof models.Role>): RolePermissionWriter {
+  const candidate = role as unknown as RolePermissionWriter;
+  if (typeof candidate.setPermissions !== 'function') {
+    throw new Error('Role is missing setPermissions');
+  }
+  return candidate;
+}
+
+function isNamed(value: unknown): value is { name: string } {
+  return !!value && typeof value === 'object' && typeof (value as { name?: unknown }).name === 'string';
+}
+
+function serializeRole(value: unknown): RoleJson {
+  if (!value || typeof value !== 'object') {
+    throw new Error('Invalid role row');
+  }
+  const row = value as {
+    id?: unknown;
+    name?: unknown;
+    Permissions?: unknown;
+    Users?: unknown;
+  };
+  if (typeof row.id !== 'string' || typeof row.name !== 'string') {
+    throw new Error('Invalid role row');
+  }
+  const permissions = Array.isArray(row.Permissions)
+    ? row.Permissions.filter(isNamed).map((permission) => permission.name)
+    : [];
+  const userCount = Array.isArray(row.Users) ? row.Users.length : 0;
+  return { id: row.id, name: row.name, permissions, userCount };
+}
+
+async function findPermissionsByName(names: string[]): Promise<{ ok: true; rows: InstanceType<typeof models.Permission>[] } | { ok: false; message: string }> {
+  const unique = Array.from(new Set(names));
+  if (unique.length === 0) {
+    return { ok: true, rows: [] };
+  }
+  const rows = await models.Permission.findAll({ where: { name: unique } });
+  if (rows.length !== unique.length) {
+    const found = new Set(rows.map((row) => row.name));
+    const missing = unique.filter((name) => !found.has(name));
+    return { ok: false, message: `Unknown permissions: ${missing.join(', ')}` };
+  }
+  return { ok: true, rows };
+}
+
+async function loadRole(id: string) {
+  return models.Role.findByPk(id, {
+    include: [
+      { model: models.Permission, through: { attributes: [] } },
+      { model: models.User, attributes: ['id'], through: { attributes: [] } },
+    ],
+  });
+}
+
+router.get('/', requirePermission(['roles.read']), async (_req: Request, res: Response) => {
+  const [roleRows, permissionRows] = await Promise.all([
+    models.Role.findAll({
+      include: [
+        { model: models.Permission, through: { attributes: [] } },
+        { model: models.User, attributes: ['id'], through: { attributes: [] } },
+      ],
+      order: [['name', 'ASC']],
+    }),
+    models.Permission.findAll({ attributes: ['id', 'name'], order: [['name', 'ASC']] }),
+  ]);
+  res.json({
+    items: roleRows.map((row) => serializeRole(row.toJSON())),
+    permissions: permissionRows.map((row) => ({ id: row.id, name: row.name })),
+  });
+});
+
+router.post('/', requirePermission(['roles.write']), validate(roleBodySchema), async (req: Request, res: Response) => {
+  const { name, permissions } = req.body as z.infer<typeof roleBodySchema>;
+  const resolved = await findPermissionsByName(permissions);
+  if (!resolved.ok) {
+    return res.status(400).json({ error: resolved.message });
+  }
+  try {
+    const role = await models.Role.create({ name });
+    await asRolePermissionWriter(role).setPermissions(resolved.rows);
+    const created = await loadRole(role.id);
+    if (!created) {
+      return res.status(500).json({ error: 'Role was created but could not be loaded' });
+    }
+    return res.status(201).json(serializeRole(created.toJSON()));
+  } catch (err) {
+    if (err instanceof UniqueConstraintError) {
+      return res.status(409).json({ error: 'Role name already exists' });
+    }
+    throw err;
+  }
+});
+
+router.put('/:id', requirePermission(['roles.write']), validate(roleBodySchema), async (req: Request, res: Response) => {
+  const { id } = req.params;
+  if (typeof id !== 'string' || id.length === 0) {
+    return res.status(400).json({ error: 'Missing role id' });
+  }
+  const role = await models.Role.findByPk(id);
+  if (!role) {
+    return res.status(404).json({ error: 'Not found' });
+  }
+  const { name, permissions } = req.body as z.infer<typeof roleBodySchema>;
+  const resolved = await findPermissionsByName(permissions);
+  if (!resolved.ok) {
+    return res.status(400).json({ error: resolved.message });
+  }
+  try {
+    role.name = name;
+    await role.save();
+    await asRolePermissionWriter(role).setPermissions(resolved.rows);
+    const updated = await loadRole(role.id);
+    if (!updated) {
+      return res.status(500).json({ error: 'Role was updated but could not be loaded' });
+    }
+    return res.json(serializeRole(updated.toJSON()));
+  } catch (err) {
+    if (err instanceof UniqueConstraintError) {
+      return res.status(409).json({ error: 'Role name already exists' });
+    }
+    throw err;
+  }
+});
+
+router.delete('/:id', requirePermission(['roles.write']), async (req: Request, res: Response) => {
+  const { id } = req.params;
+  if (typeof id !== 'string' || id.length === 0) {
+    return res.status(400).json({ error: 'Missing role id' });
+  }
+  const role = await loadRole(id);
+  if (!role) {
+    return res.status(404).json({ error: 'Not found' });
+  }
+  const current = serializeRole(role.toJSON());
+  if (current.userCount > 0) {
+    return res.status(409).json({ error: 'Role is assigned to users' });
+  }
+  await role.destroy();
+  return res.json({ ok: true });
 });
 
 export default router;
@@ -1466,6 +1940,29 @@ npm pkg set name="${PROJECT_NAME}-client"
 # Update public/index.html title and meta
 sed -i '' "s/<title>React App<\/title>/<title>${PROJECT_NAME}<\/title>/" public/index.html
 sed -i '' "s/content=\"Web site created using create-react-app\"/content=\"${PROJECT_NAME} - Full-stack TypeScript application\"/" public/index.html
+python3 - <<'PY'
+from pathlib import Path
+html_path = Path('public/index.html')
+text = html_path.read_text()
+script = """    <script>
+      (function () {
+        try {
+          var stored = localStorage.getItem('theme');
+          var theme = (stored === 'light' || stored === 'dark')
+            ? stored
+            : (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+          if (theme === 'dark') document.documentElement.classList.add('dark');
+          document.documentElement.style.colorScheme = theme;
+        } catch (err) {
+          console.warn('Theme preference could not be read', err);
+        }
+      })();
+    </script>
+"""
+if "localStorage.getItem('theme')" not in text:
+    text = text.replace('<head>', '<head>\n' + script, 1)
+    html_path.write_text(text)
+PY
 
 # Update manifest.json
 sed -i '' "s/\"name\": \"React App\"/\"name\": \"${PROJECT_NAME}\"/" public/manifest.json
@@ -1613,34 +2110,35 @@ cat > src/index.css << 'EOF'
   }
 
   .dark {
-    --background: 224 71% 4%;
-    --foreground: 213 31% 91%;
+    /* Uxcel dark-mode: no pure black, desaturated surfaces, elevation, AA contrast */
+    --background: 222 8% 7.5%;
+    --foreground: 210 16% 93%;
 
-    --muted: 223 47% 11%;
-    --muted-foreground: 215.4 16.3% 56.9%;
+    --muted: 222 8% 16%;
+    --muted-foreground: 215 10% 70%;
 
-    --popover: 224 71% 4%;
-    --popover-foreground: 215 20.2% 65.1%;
+    --popover: 222 8% 13%;
+    --popover-foreground: 210 16% 93%;
 
-    --card: 224 71% 4%;
-    --card-foreground: 213 31% 91%;
+    --card: 222 8% 11%;
+    --card-foreground: 210 16% 93%;
 
-    --border: 216 34% 17%;
-    --input: 216 34% 17%;
+    --border: 222 8% 22%;
+    --input: 222 8% 22%;
 
-    --primary: 210 40% 98%;
-    --primary-foreground: 222.2 47.4% 1.2%;
+    --primary: 210 16% 93%;
+    --primary-foreground: 222 10% 10%;
 
-    --secondary: 222.2 47.4% 11.2%;
-    --secondary-foreground: 210 40% 98%;
+    --secondary: 222 8% 16%;
+    --secondary-foreground: 210 16% 93%;
 
-    --accent: 216 34% 17%;
-    --accent-foreground: 210 40% 98%;
+    --accent: 222 8% 18%;
+    --accent-foreground: 210 16% 93%;
 
-    --destructive: 0 63% 31%;
-    --destructive-foreground: 210 40% 98%;
+    --destructive: 351 45% 61%;
+    --destructive-foreground: 222 10% 10%;
 
-    --ring: 216 34% 17%;
+    --ring: 215 12% 62%;
 
     --radius: 0.5rem;
   }
@@ -1650,10 +2148,26 @@ cat > src/index.css << 'EOF'
   * {
     @apply border-border;
   }
-  body {
+  html,
+  body,
+  #root {
     @apply bg-background text-foreground;
-    font-family: sans-serif;
+    min-height: 100vh;
+    min-height: 100dvh;
+    min-height: 100lvh;
   }
+  body {
+    font-family: sans-serif;
+    margin: 0;
+  }
+}
+
+.app-shell {
+  display: flex;
+  flex-direction: column;
+  min-height: 100vh;
+  min-height: 100dvh;
+  min-height: 100lvh;
 }
 EOF
 
@@ -1697,6 +2211,82 @@ import { twMerge } from "tailwind-merge";
 
 export function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
+}
+EOF
+
+cat > src/lib/theme.ts << 'EOF'
+export type Theme = 'light' | 'dark';
+
+export const THEME_STORAGE_KEY = 'theme';
+
+export function isTheme(value: unknown): value is Theme {
+  return value === 'light' || value === 'dark';
+}
+
+export function readStoredTheme(): Theme | null {
+  try {
+    const stored = window.localStorage.getItem(THEME_STORAGE_KEY);
+    return isTheme(stored) ? stored : null;
+  } catch (err) {
+    console.warn('Theme preference could not be read', err);
+    return null;
+  }
+}
+
+export function resolveTheme(): Theme {
+  const stored = readStoredTheme();
+  if (stored) return stored;
+  return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+}
+
+export function applyTheme(theme: Theme): void {
+  if (!isTheme(theme)) {
+    throw new Error(`Invalid theme: ${String(theme)}`);
+  }
+  document.documentElement.classList.toggle('dark', theme === 'dark');
+  document.documentElement.style.colorScheme = theme;
+  try {
+    window.localStorage.setItem(THEME_STORAGE_KEY, theme);
+  } catch (err) {
+    console.warn('Theme preference could not be saved', err);
+  }
+}
+
+export function toggleTheme(current: Theme): Theme {
+  const next = current === 'dark' ? 'light' : 'dark';
+  applyTheme(next);
+  return next;
+}
+EOF
+
+cat > src/lib/session.ts << 'EOF'
+export type SessionUser = {
+  id: string;
+  email: string;
+  roles: string[];
+  permissions: string[];
+};
+
+export function isSessionUser(value: unknown): value is SessionUser {
+  if (!value || typeof value !== 'object') return false;
+  const record = value as Record<string, unknown>;
+  return typeof record.id === 'string'
+    && typeof record.email === 'string'
+    && Array.isArray(record.roles)
+    && record.roles.every((item) => typeof item === 'string')
+    && Array.isArray(record.permissions)
+    && record.permissions.every((item) => typeof item === 'string');
+}
+
+export async function fetchSession(): Promise<SessionUser | null> {
+  const res = await fetch('/auth/me');
+  if (!res.ok) return null;
+  const data: unknown = await res.json();
+  return isSessionUser(data) ? data : null;
+}
+
+export function hasPermission(session: SessionUser | null, permission: string): boolean {
+  return !!session?.permissions.includes(permission);
 }
 EOF
 
@@ -1760,6 +2350,7 @@ npm install --save react-router-dom
 npx shadcn@latest add input --yes
 npx shadcn@latest add label --yes
 npx shadcn@latest add dialog --yes
+sed -i '' 's/border bg-background p-6/border bg-popover p-6/' src/components/ui/dialog.tsx
 npx shadcn@latest add checkbox --yes || true
 npx shadcn@latest add dropdown-menu --yes || true
 npx shadcn@latest add select --yes || true
@@ -1807,25 +2398,36 @@ mkdir -p src/components
 cat > src/components/AppHeader.tsx << EOF
 import { useEffect, useState } from 'react';
 import { Link, useNavigate, useLocation } from 'react-router-dom';
+import { CircleUser, Home, LogOut, Settings, Shield, Users } from 'lucide-react';
 import { Button } from './ui/button';
-import { CircleUser } from 'lucide-react';
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from './ui/dropdown-menu';
+import ThemeToggle from './ThemeToggle';
+import { fetchSession, hasPermission } from '../lib/session';
 
 export default function AppHeader() {
   const [email, setEmail] = useState<string | null>(null);
-  const [isAdmin, setIsAdmin] = useState(false);
+  const [canReadUsers, setCanReadUsers] = useState(false);
+  const [canReadRoles, setCanReadRoles] = useState(false);
   const navigate = useNavigate();
   const location = useLocation();
+  const homeActive = location.pathname === '/home';
+  const usersActive = location.pathname.startsWith('/admin/users');
+  const rolesActive = location.pathname.startsWith('/admin/roles');
+  const settingsActive = usersActive || rolesActive;
+  const showSettings = canReadUsers || canReadRoles;
 
   useEffect(() => {
     (async () => {
-      try {
-        const res = await fetch('/auth/me');
-        if (!res.ok) return;
-        const data = await res.json();
-        setEmail(data.email || null);
-        const roles: string[] = data.roles || [];
-        setIsAdmin(roles.includes('admin'));
-      } catch {}
+      const session = await fetchSession();
+      if (!session) return;
+      setEmail(session.email);
+      setCanReadUsers(hasPermission(session, 'users.read'));
+      setCanReadRoles(hasPermission(session, 'roles.read'));
     })();
   }, [location.pathname]);
 
@@ -1838,21 +2440,64 @@ export default function AppHeader() {
   }
 
   return (
-    <header className="sticky top-0 z-40 w-full border-b bg-background">
+    <header className="sticky top-0 z-40 w-full border-b bg-card">
       <div className="container mx-auto h-14 flex items-center justify-between px-4">
         <Link to="/home" className="font-semibold">${PROJECT_NAME}</Link>
         <nav className="flex items-center gap-4">
-          <Button asChild variant="ghost" size="sm"><Link to="/home">Home</Link></Button>
-          {isAdmin && (
-            <Button asChild variant="ghost" size="sm"><Link to="/admin/users">Users</Link></Button>
+          <Button asChild variant={homeActive ? 'secondary' : 'ghost'} size="sm">
+            <Link to="/home" aria-current={homeActive ? 'page' : undefined}>
+              <Home />
+              Home
+            </Link>
+          </Button>
+          {showSettings && (
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button
+                  variant={settingsActive ? 'secondary' : 'ghost'}
+                  size="sm"
+                  aria-current={settingsActive ? 'page' : undefined}
+                >
+                  <Settings />
+                  Settings
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="start">
+                {canReadUsers && (
+                  <DropdownMenuItem asChild>
+                    <Link to="/admin/users" aria-current={usersActive ? 'page' : undefined}>
+                      <Users />
+                      Users
+                    </Link>
+                  </DropdownMenuItem>
+                )}
+                {canReadRoles && (
+                  <DropdownMenuItem asChild>
+                    <Link to="/admin/roles" aria-current={rolesActive ? 'page' : undefined}>
+                      <Shield />
+                      Roles
+                    </Link>
+                  </DropdownMenuItem>
+                )}
+              </DropdownMenuContent>
+            </DropdownMenu>
           )}
         </nav>
         <div className="flex items-center gap-3">
+          <ThemeToggle />
           {email ? (
             <>
               <CircleUser className="w-5 h-5" />
               <span className="text-sm text-muted-foreground hidden sm:inline">{email}</span>
-              <Button size="sm" variant="outline" onClick={onLogout}>Logout</Button>
+              <Button
+                size="icon"
+                variant="outline"
+                className="h-8 w-8"
+                onClick={onLogout}
+                aria-label="Logout"
+              >
+                <LogOut />
+              </Button>
             </>
           ) : (
             <Button asChild size="sm"><Link to="/">Login</Link></Button>
@@ -1860,6 +2505,128 @@ export default function AppHeader() {
         </div>
       </div>
     </header>
+  );
+}
+EOF
+
+cat > src/components/ThemeToggle.tsx << 'EOF'
+import { useState } from 'react';
+import { Moon, Sun } from 'lucide-react';
+import { Button } from './ui/button';
+import { resolveTheme, toggleTheme, type Theme } from '../lib/theme';
+
+export default function ThemeToggle() {
+  const [theme, setTheme] = useState<Theme>(() => resolveTheme());
+
+  return (
+    <Button
+      type="button"
+      size="icon"
+      variant="outline"
+      className="h-8 w-8"
+      onClick={() => setTheme((current) => toggleTheme(current))}
+      aria-label={theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'}
+      aria-pressed={theme === 'dark'}
+    >
+      {theme === 'dark' ? <Sun /> : <Moon />}
+    </Button>
+  );
+}
+EOF
+
+cat > src/components/AuthLayout.tsx << 'EOF'
+import type { ReactNode } from 'react';
+import ThemeToggle from './ThemeToggle';
+
+type Props = {
+  title: string;
+  children: ReactNode;
+};
+
+export default function AuthLayout({ title, children }: Props) {
+  return (
+    <div className="relative min-h-screen flex items-center justify-center p-6">
+      <div className="absolute top-4 right-4">
+        <ThemeToggle />
+      </div>
+      <div className="w-full max-w-sm rounded-lg border bg-card p-6">
+        <h1 className="text-2xl font-semibold mb-4">{title}</h1>
+        {children}
+      </div>
+    </div>
+  );
+}
+EOF
+
+cat > src/components/MessageDialog.tsx << 'EOF'
+import { Button } from './ui/button';
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from './ui/dialog';
+
+export type MessageNotice = {
+  title: string;
+  message: string;
+};
+
+type Props = {
+  notice: MessageNotice | null;
+  onClose: () => void;
+};
+
+export default function MessageDialog({ notice, onClose }: Props) {
+  return (
+    <Dialog open={notice !== null} onOpenChange={(next) => { if (!next) onClose(); }}>
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle>{notice?.title ?? ''}</DialogTitle>
+          <DialogDescription>{notice?.message ?? ''}</DialogDescription>
+        </DialogHeader>
+        <DialogFooter>
+          <Button type="button" onClick={onClose}>OK</Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+EOF
+
+cat > src/components/PasswordInput.tsx << 'EOF'
+import { useState, type ComponentProps } from 'react';
+import { Eye, EyeOff } from 'lucide-react';
+import { Button } from './ui/button';
+import { Input } from './ui/input';
+import { cn } from '../lib/utils';
+
+type Props = Omit<ComponentProps<typeof Input>, 'type'>;
+
+export default function PasswordInput({ className, ...props }: Props) {
+  const [visible, setVisible] = useState(false);
+
+  return (
+    <div className="relative">
+      <Input
+        {...props}
+        type={visible ? 'text' : 'password'}
+        className={cn('pr-10', className)}
+      />
+      <Button
+        type="button"
+        variant="ghost"
+        size="icon"
+        className="absolute right-0 top-0 z-10 h-10 w-10 text-muted-foreground"
+        onClick={() => setVisible((current) => !current)}
+        aria-label={visible ? 'Hide password' : 'Show password'}
+        aria-pressed={visible}
+      >
+        {visible ? <EyeOff /> : <Eye />}
+      </Button>
+    </div>
   );
 }
 EOF
@@ -1925,15 +2692,17 @@ import { Button } from './components/ui/button';
 import AppHeader from './components/AppHeader';
 import Login from './pages/Login';
 import AdminUsers from './pages/AdminUsers';
+import AdminRoles from './pages/AdminRoles';
 import ProtectedRoute from './components/ProtectedRoute';
 import ForgotPassword from './pages/ForgotPassword';
 import ResetPassword from './pages/ResetPassword';
+import AcceptInvite from './pages/AcceptInvite';
 
 function Home() {
   return (
-    <div className="min-h-screen">
+    <div className="app-shell">
       <AppHeader />
-      <main className="flex flex-col items-center justify-center p-6">
+      <main className="flex flex-1 flex-col items-center justify-center p-6">
         <img src="/favicon.ico" className="w-24 h-24 mb-6" alt="${PROJECT_NAME} logo" />
         <h1 className="text-4xl font-bold mb-4">${PROJECT_NAME}</h1>
         <p className="text-muted-foreground mb-6">Full-stack Express TypeScript + React + shadcn/ui</p>
@@ -1968,7 +2737,9 @@ export default function App() {
       <Route path="/home" element={<Home />} />
       <Route path="/forgot" element={<ForgotPassword />} />
       <Route path="/reset" element={<ResetPassword />} />
-      <Route path="/admin/users" element={<ProtectedRoute roles={["admin"]}><AdminUsers /></ProtectedRoute>} />
+      <Route path="/invite" element={<AcceptInvite />} />
+      <Route path="/admin/users" element={<ProtectedRoute permissions={['users.read']}><AdminUsers /></ProtectedRoute>} />
+      <Route path="/admin/roles" element={<ProtectedRoute permissions={['roles.read']}><AdminRoles /></ProtectedRoute>} />
     </Routes>
   );
 }
@@ -1981,8 +2752,15 @@ import ReactDOM from 'react-dom/client';
 import { BrowserRouter } from 'react-router-dom';
 import './index.css';
 import App from './App';
+import { applyTheme, resolveTheme } from './lib/theme';
 
-const root = ReactDOM.createRoot(document.getElementById('root') as HTMLElement);
+applyTheme(resolveTheme());
+
+const rootElement = document.getElementById('root');
+if (!rootElement) {
+  throw new Error('Root element #root was not found');
+}
+const root = ReactDOM.createRoot(rootElement);
 root.render(
   <React.StrictMode>
     <BrowserRouter>
@@ -1997,6 +2775,8 @@ mkdir -p src/pages
 cat > src/pages/Login.tsx << 'EOF'
 import { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
+import AuthLayout from '../components/AuthLayout';
+import PasswordInput from '../components/PasswordInput';
 import { Button } from '../components/ui/button';
 import { Input } from '../components/ui/input';
 import { Label } from '../components/ui/label';
@@ -2019,40 +2799,43 @@ export default function Login() {
       if (!res.ok) throw new Error('Invalid credentials');
       await res.json();
       navigate('/home');
-    } catch (err: any) {
-      setMessage(err.message || 'Login failed');
+    } catch (err: unknown) {
+      setMessage(err instanceof Error ? err.message : 'Login failed');
     }
   }
 
   return (
-    <div className="min-h-screen flex items-center justify-center p-6">
-      <div className="w-full max-w-sm border rounded-lg p-6">
-        <h1 className="text-2xl font-semibold mb-4">Sign in</h1>
-        <form className="space-y-4" onSubmit={loginSession}>
-          <div className="grid gap-2">
-            <Label htmlFor="email">Email</Label>
-            <Input id="email" type="email" value={email} onChange={e => setEmail(e.target.value)} required />
-          </div>
-          <div className="grid gap-2">
-            <Label htmlFor="password">Password</Label>
-            <Input id="password" type="password" value={password} onChange={e => setPassword(e.target.value)} required />
-          </div>
-          <Button type="submit" className="w-full">Login</Button>
-        </form>
-        <div className="mt-3 text-right">
-          <a href="/forgot" className="text-sm text-blue-600 hover:underline">Forgot password?</a>
+    <AuthLayout title="Sign in">
+      <form className="space-y-4" onSubmit={loginSession}>
+        <div className="grid gap-2">
+          <Label htmlFor="email">Email</Label>
+          <Input id="email" type="email" value={email} onChange={e => setEmail(e.target.value)} required />
         </div>
-        {message && <p className="text-sm text-muted-foreground mt-4">{message}</p>}
+        <div className="grid gap-2">
+          <Label htmlFor="password">Password</Label>
+          <PasswordInput
+            id="password"
+            value={password}
+            onChange={e => setPassword(e.target.value)}
+            required
+          />
+        </div>
+        <Button type="submit" className="w-full">Login</Button>
+      </form>
+      <div className="mt-3 text-right">
+        <a href="/forgot" className="text-sm text-primary underline-offset-4 hover:underline">Forgot password?</a>
       </div>
-    </div>
+      {message && <p className="mt-4 text-sm text-destructive">{message}</p>}
+    </AuthLayout>
   );
 }
+
 EOF
 
 # Forgot Password page
 cat > src/pages/ForgotPassword.tsx << 'EOF'
 import { useState } from 'react';
-import AppHeader from '../components/AppHeader';
+import AuthLayout from '../components/AuthLayout';
 import { Button } from '../components/ui/button';
 import { Input } from '../components/ui/input';
 import { Label } from '../components/ui/label';
@@ -2060,38 +2843,40 @@ import { Label } from '../components/ui/label';
 export default function ForgotPassword() {
   const [email, setEmail] = useState('');
   const [msg, setMsg] = useState<string | null>(null);
+
   async function submit(e: React.FormEvent) {
     e.preventDefault();
     setMsg(null);
     const res = await fetch('/api/auth/request-reset', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email }) });
     setMsg(res.ok ? 'If the email exists, a reset link was sent or logged.' : 'Request failed');
   }
+
   return (
-    <div className="min-h-screen">
-      <AppHeader />
-      <main className="max-w-md mx-auto p-6">
-        <h1 className="text-2xl font-semibold mb-4">Forgot password</h1>
-        <form className="space-y-4" onSubmit={submit}>
-          <div>
-            <Label htmlFor="email">Email</Label>
-            <Input id="email" value={email} onChange={e => setEmail(e.target.value)} required />
-          </div>
-          <Button type="submit" className="w-full">Send reset link</Button>
-        </form>
-        {msg && <p className="text-sm text-muted-foreground mt-4">{msg}</p>}
-      </main>
-    </div>
+    <AuthLayout title="Forgot password">
+      <form className="space-y-4" onSubmit={submit}>
+        <div className="grid gap-2">
+          <Label htmlFor="email">Email</Label>
+          <Input id="email" type="email" value={email} onChange={e => setEmail(e.target.value)} required />
+        </div>
+        <Button type="submit" className="w-full">Send reset link</Button>
+      </form>
+      <div className="mt-3 text-right">
+        <a href="/" className="text-sm text-primary underline-offset-4 hover:underline">Back to sign in</a>
+      </div>
+      {msg && <p className="mt-4 text-sm text-muted-foreground">{msg}</p>}
+    </AuthLayout>
   );
 }
+
 EOF
 
 # Reset Password page
 cat > src/pages/ResetPassword.tsx << 'EOF'
 import { useState } from 'react';
 import { useSearchParams, useNavigate } from 'react-router-dom';
-import AppHeader from '../components/AppHeader';
+import AuthLayout from '../components/AuthLayout';
+import PasswordInput from '../components/PasswordInput';
 import { Button } from '../components/ui/button';
-import { Input } from '../components/ui/input';
 import { Label } from '../components/ui/label';
 
 export default function ResetPassword() {
@@ -2115,34 +2900,205 @@ export default function ResetPassword() {
   }
 
   return (
-    <div className="min-h-screen">
-      <AppHeader />
-      <main className="max-w-md mx-auto p-6">
-        <h1 className="text-2xl font-semibold mb-4">Reset password</h1>
-        <form className="space-y-4" onSubmit={submit}>
-          <div>
-            <Label htmlFor="password">New password</Label>
-            <Input id="password" type="password" value={password} onChange={e => setPassword(e.target.value)} required />
-          </div>
-          <Button type="submit" className="w-full">Update password</Button>
-        </form>
-        {msg && <p className="text-sm text-muted-foreground mt-4">{msg}</p>}
-      </main>
-    </div>
+    <AuthLayout title="Reset password">
+      <form className="space-y-4" onSubmit={submit}>
+        <div className="grid gap-2">
+          <Label htmlFor="password">New password</Label>
+          <PasswordInput id="password" value={password} onChange={e => setPassword(e.target.value)} required />
+        </div>
+        <Button type="submit" className="w-full">Update password</Button>
+      </form>
+      <div className="mt-3 text-right">
+        <a href="/" className="text-sm text-primary underline-offset-4 hover:underline">Back to sign in</a>
+      </div>
+      {msg && <p className="mt-4 text-sm text-muted-foreground">{msg}</p>}
+    </AuthLayout>
   );
 }
+
+EOF
+
+# Accept invite page
+cat > src/pages/AcceptInvite.tsx << 'EOF'
+import { useEffect, useState } from 'react';
+import { useNavigate, useSearchParams } from 'react-router-dom';
+import AuthLayout from '../components/AuthLayout';
+import PasswordInput from '../components/PasswordInput';
+import { Button } from '../components/ui/button';
+import { Label } from '../components/ui/label';
+
+function isInvitePreview(value: unknown): value is { email: string } {
+  return !!value && typeof value === 'object' && typeof (value as { email?: unknown }).email === 'string';
+}
+
+export default function AcceptInvite() {
+  const [params] = useSearchParams();
+  const navigate = useNavigate();
+  const token = params.get('token') || '';
+  const userId = params.get('uid') || '';
+  const [email, setEmail] = useState<string | null>(null);
+  const [password, setPassword] = useState('');
+  const [confirm, setConfirm] = useState('');
+  const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    (async () => {
+      if (!token || !userId) {
+        setError('This invite link is invalid or expired.');
+        setLoading(false);
+        return;
+      }
+      const res = await fetch(`/api/auth/invite?${new URLSearchParams({ token, uid: userId }).toString()}`);
+      const data: unknown = await res.json().catch(() => null);
+      if (!res.ok || !isInvitePreview(data)) {
+        setError('This invite link is invalid or expired.');
+        setLoading(false);
+        return;
+      }
+      setEmail(data.email);
+      setLoading(false);
+    })();
+  }, [token, userId]);
+
+  async function submit(event: React.FormEvent) {
+    event.preventDefault();
+    setError(null);
+    if (password.length < 8) {
+      setError('Password must be at least 8 characters.');
+      return;
+    }
+    if (password !== confirm) {
+      setError('Passwords do not match.');
+      return;
+    }
+    const res = await fetch('/api/auth/invite', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ userId, token, password }),
+    });
+    if (!res.ok) {
+      setError('This invite link is invalid or expired.');
+      return;
+    }
+    navigate('/', { replace: true });
+  }
+
+  return (
+    <AuthLayout title="Create your account">
+      {loading && <p className="text-sm text-muted-foreground">Checking invite…</p>}
+      {!loading && error && !email && <p className="text-sm text-destructive">{error}</p>}
+      {!loading && email && (
+        <form className="space-y-4" onSubmit={submit}>
+          <p className="text-sm text-muted-foreground">Set a password for <span className="text-foreground">{email}</span>.</p>
+          <div className="grid gap-2">
+            <Label htmlFor="password">Password</Label>
+            <PasswordInput
+              id="password"
+              value={password}
+              onChange={(event) => setPassword(event.target.value)}
+              required
+              minLength={8}
+            />
+          </div>
+          <div className="grid gap-2">
+            <Label htmlFor="confirm">Confirm password</Label>
+            <PasswordInput
+              id="confirm"
+              value={confirm}
+              onChange={(event) => setConfirm(event.target.value)}
+              required
+              minLength={8}
+            />
+          </div>
+          {error && <p className="text-sm text-destructive">{error}</p>}
+          <Button type="submit" className="w-full">Create account</Button>
+        </form>
+      )}
+    </AuthLayout>
+  );
+}
+
 EOF
 
 # Admin Users page (shadcn table integration)
 cat > src/pages/AdminUsers.tsx << 'EOF'
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useState } from 'react';
+import { ChevronLeft, ChevronRight, MoreHorizontal } from 'lucide-react';
 import AppHeader from '../components/AppHeader';
+import MessageDialog from '../components/MessageDialog';
 import { Button } from '../components/ui/button';
-import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger } from '../components/ui/dialog';
+import { Dialog, DialogContent, DialogHeader, DialogTitle } from '../components/ui/dialog';
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from '../components/ui/dropdown-menu';
 import { Input } from '../components/ui/input';
 import { Label } from '../components/ui/label';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '../components/ui/select';
+import { fetchSession, hasPermission } from '../lib/session';
 
-type User = { id: string; email: string; firstName?: string; lastName?: string; isActive: boolean; createdAt: string };
+function defaultRoleName(options: string[]): string {
+  if (options.includes('user')) return 'user';
+  return options[0] ?? '';
+}
+
+type User = {
+  id: string;
+  email: string;
+  firstName?: string;
+  lastName?: string;
+  isActive: boolean;
+  lastLoginAt: string | null;
+  inviteAcceptedAt: string | null;
+  createdAt: string;
+  roles: string[];
+};
+
+type InviteLink = { url: string; expiresAt: string };
+
+function isPendingUser(user: User): boolean {
+  return !user.isActive && !user.inviteAcceptedAt;
+}
+
+function statusLabel(user: User): string {
+  if (user.isActive) return 'Active';
+  if (!user.inviteAcceptedAt) return 'Pending';
+  return 'Inactive';
+}
+
+function isUser(value: unknown): value is User {
+  if (!value || typeof value !== 'object') return false;
+  const row = value as Record<string, unknown>;
+  return typeof row.id === 'string'
+    && typeof row.email === 'string'
+    && typeof row.isActive === 'boolean'
+    && (row.lastLoginAt === null || row.lastLoginAt !== undefined)
+    && (row.inviteAcceptedAt === null || row.inviteAcceptedAt !== undefined)
+    && row.createdAt !== undefined
+    && Array.isArray(row.roles)
+    && row.roles.every((item) => typeof item === 'string');
+}
+
+function isInviteResponse(value: unknown): value is { inviteUrl: string; expiresAt: string } {
+  return !!value
+    && typeof value === 'object'
+    && typeof (value as { inviteUrl?: unknown }).inviteUrl === 'string'
+    && (value as { inviteUrl: string }).inviteUrl.length > 0
+    && (value as { expiresAt?: unknown }).expiresAt !== undefined;
+}
+
+function inviteUrlForBrowser(serverUrl: string): string {
+  try {
+    const parsed = new URL(serverUrl, window.location.origin);
+    return `${window.location.origin}${parsed.pathname}${parsed.search}`;
+  } catch {
+    return serverUrl;
+  }
+}
 
 export default function AdminUsers() {
   const [items, setItems] = useState<User[]>([]);
@@ -2151,26 +3107,101 @@ export default function AdminUsers() {
   const [pageSize, setPageSize] = useState(10);
   const [q, setQ] = useState('');
   const [open, setOpen] = useState(false);
-  const [form, setForm] = useState({ email: '', firstName: '', lastName: '', password: '', roles: 'user' });
+  const [canWrite, setCanWrite] = useState(false);
+  const [roleOptions, setRoleOptions] = useState<string[]>([]);
+  const [form, setForm] = useState({ email: '', firstName: '', lastName: '', roles: ['user'] });
+  const [formError, setFormError] = useState<string | null>(null);
+  const [invite, setInvite] = useState<InviteLink | null>(null);
+  const [copied, setCopied] = useState(false);
+  const [notice, setNotice] = useState<{ title: string; message: string } | null>(null);
 
   async function load() {
     const res = await fetch(`/api/admin/users?q=${encodeURIComponent(q)}&page=${page}&pageSize=${pageSize}`);
     if (res.status === 403) {
       setItems([]);
       setTotal(0);
+      setRoleOptions([]);
       return;
     }
-    const data = await res.json();
-    setItems(data.items || []);
-    setTotal(data.total || 0);
+    const data: unknown = await res.json();
+    if (!data || typeof data !== 'object') {
+      throw new Error('Invalid users response');
+    }
+    const payload = data as { items?: unknown; total?: unknown; roleOptions?: unknown };
+    setItems(Array.isArray(payload.items) ? payload.items.filter(isUser) : []);
+    setTotal(typeof payload.total === 'number' ? payload.total : 0);
+    setRoleOptions(Array.isArray(payload.roleOptions) ? payload.roleOptions.filter((item): item is string => typeof item === 'string') : []);
   }
+
+  useEffect(() => {
+    (async () => {
+      const session = await fetchSession();
+      setCanWrite(hasPermission(session, 'users.write'));
+    })();
+  }, []);
 
   useEffect(() => { load(); }, [q, page, pageSize]);
 
+  useEffect(() => {
+    setForm((current) => {
+      const currentRole = current.roles[0];
+      if (currentRole && roleOptions.includes(currentRole)) return current;
+      const nextRole = defaultRoleName(roleOptions);
+      return { ...current, roles: nextRole ? [nextRole] : [] };
+    });
+  }, [roleOptions]);
+
+  function resetCreateForm() {
+    const nextRole = defaultRoleName(roleOptions);
+    setForm({ email: '', firstName: '', lastName: '', roles: nextRole ? [nextRole] : [] });
+    setFormError(null);
+  }
+
+  async function copyInvite(url: string) {
+    try {
+      await navigator.clipboard.writeText(url);
+      setCopied(true);
+    } catch {
+      setCopied(false);
+    }
+  }
+
   async function createUser() {
-    const body = { ...form, roles: form.roles.split(',').map(r => r.trim()).filter(Boolean) };
-    const res = await fetch('/api/admin/users', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
-    if (res.ok) { setOpen(false); setForm({ email: '', firstName: '', lastName: '', password: '', roles: 'user' }); load(); }
+    const role = form.roles[0];
+    if (!role || !roleOptions.includes(role)) return;
+    setFormError(null);
+    const res = await fetch('/api/admin/users', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...form, email: form.email.trim().toLowerCase() }),
+    });
+    const data: unknown = await res.json().catch(() => null);
+    if (!res.ok || !isInviteResponse(data)) {
+      const message = data && typeof data === 'object' && typeof (data as { error?: unknown }).error === 'string'
+        ? (data as { error: string }).error
+        : 'Invite failed';
+      setFormError(message);
+      return;
+    }
+    setOpen(false);
+    resetCreateForm();
+    setInvite({ url: inviteUrlForBrowser(data.inviteUrl), expiresAt: String(data.expiresAt) });
+    setCopied(false);
+    load();
+  }
+
+  async function createInviteLink(user: User) {
+    const res = await fetch(`/api/admin/users/${user.id}/invite`, { method: 'POST' });
+    const data: unknown = await res.json().catch(() => null);
+    if (!res.ok || !isInviteResponse(data)) {
+      const message = data && typeof data === 'object' && typeof (data as { error?: unknown }).error === 'string'
+        ? (data as { error: string }).error
+        : 'Could not create invite link';
+      setNotice({ title: 'Invite failed', message });
+      return;
+    }
+    setInvite({ url: inviteUrlForBrowser(data.inviteUrl), expiresAt: String(data.expiresAt) });
+    setCopied(false);
   }
 
   async function toggleActive(user: User) {
@@ -2184,23 +3215,54 @@ export default function AdminUsers() {
   }
 
   async function resetPassword(user: User) {
-    await fetch(`/api/admin/users/${user.id}/reset`, { method: 'POST' });
-    alert('If SMTP is configured, a reset email was sent; otherwise the link was logged on server.');
+    const res = await fetch(`/api/admin/users/${user.id}/reset`, { method: 'POST' });
+    if (!res.ok) {
+      const data: unknown = await res.json().catch(() => null);
+      const message = data && typeof data === 'object' && typeof (data as { error?: unknown }).error === 'string'
+        ? (data as { error: string }).error
+        : 'Could not reset password';
+      setNotice({ title: 'Reset failed', message });
+      return;
+    }
+    setNotice({
+      title: 'Password reset',
+      message: 'If SMTP is configured, a reset email was sent; otherwise the link was logged on the server.',
+    });
   }
 
   return (
     <div className="min-h-screen">
       <AppHeader />
+      <MessageDialog notice={notice} onClose={() => setNotice(null)} />
       <div className="container mx-auto py-8">
         <div className="flex items-center justify-between mb-4">
           <h1 className="text-2xl font-semibold">Users</h1>
-          <Dialog open={open} onOpenChange={setOpen}>
-            <DialogTrigger asChild>
-              <Button>New User</Button>
-            </DialogTrigger>
+          {canWrite && (
+            <Button type="button" onClick={() => { resetCreateForm(); setOpen(true); }}>Invite User</Button>
+          )}
+          <Dialog open={invite !== null} onOpenChange={(next) => { if (!next) { setInvite(null); setCopied(false); } }}>
             <DialogContent>
               <DialogHeader>
-                <DialogTitle>Create User</DialogTitle>
+                <DialogTitle>Invite link</DialogTitle>
+              </DialogHeader>
+              <div className="grid gap-3">
+                <p className="text-sm text-muted-foreground">
+                  Send this link offline. It expires in 3 days and can only be used once.
+                </p>
+                <Input id="invite-url" readOnly value={invite?.url ?? ''} onFocus={(event) => event.currentTarget.select()} />
+                <Button
+                  type="button"
+                  onClick={() => { if (invite) void copyInvite(invite.url); }}
+                >
+                  {copied ? 'Copied' : 'Copy link'}
+                </Button>
+              </div>
+            </DialogContent>
+          </Dialog>
+          <Dialog open={open} onOpenChange={setOpen}>
+            <DialogContent>
+              <DialogHeader>
+                <DialogTitle>Invite User</DialogTitle>
               </DialogHeader>
               <div className="grid gap-3">
                 <div>
@@ -2218,14 +3280,24 @@ export default function AdminUsers() {
                   </div>
                 </div>
                 <div>
-                  <Label htmlFor="password">Password</Label>
-                  <Input id="password" type="password" value={form.password} onChange={e => setForm({ ...form, password: e.target.value })} />
+                  <Label htmlFor="role">Role</Label>
+                  <Select
+                    value={form.roles[0] && roleOptions.includes(form.roles[0]) ? form.roles[0] : undefined}
+                    onValueChange={(value) => setForm((current) => ({ ...current, roles: [value] }))}
+                    disabled={roleOptions.length === 0}
+                  >
+                    <SelectTrigger id="role" aria-label="Role">
+                      <SelectValue placeholder="Select a role" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {roleOptions.map((role) => (
+                        <SelectItem key={role} value={role}>{role}</SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
                 </div>
-                <div>
-                  <Label htmlFor="roles">Roles (comma separated)</Label>
-                  <Input id="roles" value={form.roles} onChange={e => setForm({ ...form, roles: e.target.value })} />
-                </div>
-                <Button onClick={createUser}>Create</Button>
+                {formError && <p className="text-sm text-destructive">{formError}</p>}
+                <Button onClick={createUser} disabled={!form.email || roleOptions.length === 0 || !form.roles[0] || !roleOptions.includes(form.roles[0])}>Create invite</Button>
               </div>
             </DialogContent>
           </Dialog>
@@ -2239,7 +3311,8 @@ export default function AdminUsers() {
               <tr className="bg-muted/50">
                 <th className="text-left p-2 font-semibold">Email</th>
                 <th className="text-left p-2 font-semibold">Name</th>
-                <th className="text-left p-2 font-semibold">Active</th>
+                <th className="text-left p-2 font-semibold">Roles</th>
+                <th className="text-left p-2 font-semibold">Status</th>
                 <th className="text-left p-2 font-semibold">Created</th>
                 <th className="text-left p-2 font-semibold">Actions</th>
               </tr>
@@ -2249,14 +3322,47 @@ export default function AdminUsers() {
                 <tr key={u.id} className="border-t">
                   <td className="p-2">{u.email}</td>
                   <td className="p-2">{`${u.firstName || ''} ${u.lastName || ''}`.trim()}</td>
-                  <td className="p-2">{u.isActive ? 'Yes' : 'No'}</td>
+                  <td className="p-2">{u.roles.length ? u.roles.join(', ') : '—'}</td>
+                  <td className="p-2">{statusLabel(u)}</td>
                   <td className="p-2">{new Date(u.createdAt).toLocaleString()}</td>
                   <td className="p-2">
-                    <div className="flex gap-2">
-                      <Button size="sm" variant="outline" onClick={() => toggleActive(u)}>{u.isActive ? 'Deactivate' : 'Activate'}</Button>
-                      <Button size="sm" variant="destructive" onClick={() => removeUser(u)}>Delete</Button>
-                      <Button size="sm" onClick={() => resetPassword(u)}>Reset</Button>
-                    </div>
+                    {canWrite && (
+                    <DropdownMenu>
+                      <DropdownMenuTrigger asChild>
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          className="h-8 w-8"
+                          aria-label={`Actions for ${u.email}`}
+                        >
+                          <MoreHorizontal />
+                        </Button>
+                      </DropdownMenuTrigger>
+                      <DropdownMenuContent align="end">
+                        {isPendingUser(u) ? (
+                          <DropdownMenuItem onClick={() => createInviteLink(u)}>
+                            Copy invite link
+                          </DropdownMenuItem>
+                        ) : (
+                          <>
+                            <DropdownMenuItem onClick={() => toggleActive(u)}>
+                              {u.isActive ? 'Deactivate' : 'Activate'}
+                            </DropdownMenuItem>
+                            <DropdownMenuItem onClick={() => resetPassword(u)}>
+                              Reset password
+                            </DropdownMenuItem>
+                          </>
+                        )}
+                        <DropdownMenuSeparator />
+                        <DropdownMenuItem
+                          className="text-destructive focus:bg-destructive/15 focus:text-destructive"
+                          onClick={() => removeUser(u)}
+                        >
+                          Delete
+                        </DropdownMenuItem>
+                      </DropdownMenuContent>
+                    </DropdownMenu>
+                    )}
                   </td>
                 </tr>
               ))}
@@ -2266,10 +3372,33 @@ export default function AdminUsers() {
         <div className="flex items-center justify-between mt-3">
           <div>Page {page} of {Math.max(1, Math.ceil(total / pageSize))} • {total} total</div>
           <div className="flex items-center gap-2">
-            <button disabled={page<=1} onClick={() => setPage(page-1)} className="px-2 py-1 border rounded">Prev</button>
-            <button disabled={page>=Math.max(1, Math.ceil(total / pageSize))} onClick={() => setPage(page+1)} className="px-2 py-1 border rounded">Next</button>
-            <select value={pageSize} onChange={e => setPageSize(parseInt(e.target.value,10))} className="border rounded p-1">
-              {[10,20,50].map(s => <option key={s} value={s}>{s}/page</option>)}
+            <Button
+              variant="outline"
+              size="icon"
+              className="h-8 w-8"
+              disabled={page <= 1}
+              onClick={() => setPage(page - 1)}
+              aria-label="Previous page"
+            >
+              <ChevronLeft />
+            </Button>
+            <Button
+              variant="outline"
+              size="icon"
+              className="h-8 w-8"
+              disabled={page >= Math.max(1, Math.ceil(total / pageSize))}
+              onClick={() => setPage(page + 1)}
+              aria-label="Next page"
+            >
+              <ChevronRight />
+            </Button>
+            <select
+              value={pageSize}
+              onChange={e => setPageSize(parseInt(e.target.value, 10))}
+              aria-label="Rows per page"
+              className="h-8 rounded-md border border-input bg-background px-2 text-sm"
+            >
+              {[10, 20, 50].map(s => <option key={s} value={s}>{s}</option>)}
             </select>
           </div>
         </div>
@@ -2277,6 +3406,7 @@ export default function AdminUsers() {
     </div>
   );
 }
+
 EOF
 
 # ProtectedRoute component
@@ -2284,30 +3414,295 @@ mkdir -p src/components
 cat > src/components/ProtectedRoute.tsx << 'EOF'
 import { ReactNode, useEffect, useState } from 'react';
 import { Navigate } from 'react-router-dom';
+import { fetchSession } from '../lib/session';
 
-type Props = { children: ReactNode; roles?: string[] };
+type Props = { children: ReactNode; roles?: string[]; permissions?: string[] };
 
-export default function ProtectedRoute({ children, roles }: Props) {
+export default function ProtectedRoute({ children, roles, permissions }: Props) {
   const [allowed, setAllowed] = useState<boolean | null>(null);
 
   useEffect(() => {
     (async () => {
-      try {
-        const res = await fetch('/auth/me');
-        if (!res.ok) return setAllowed(false);
-        const data = await res.json();
-        if (!roles || roles.length === 0) return setAllowed(true);
-        const userRoles: string[] = data.roles || [];
-        setAllowed(roles.some(r => userRoles.includes(r)));
-      } catch {
+      const session = await fetchSession();
+      if (!session) {
         setAllowed(false);
+        return;
       }
+      const roleOk = !roles || roles.length === 0 || roles.some((role) => session.roles.includes(role));
+      const permissionOk = !permissions || permissions.length === 0
+        || permissions.some((permission) => session.permissions.includes(permission));
+      setAllowed(roleOk && permissionOk);
     })();
-  }, [roles?.join(',')]);
+  }, [roles?.join(','), permissions?.join(',')]);
 
   if (allowed === null) return <div className="p-4 text-center text-sm text-muted-foreground">Loading...</div>;
   return allowed ? <>{children}</> : <Navigate to="/" replace />;
 }
+EOF
+
+cat > src/pages/AdminRoles.tsx << 'EOF'
+import { useEffect, useState } from 'react';
+import { MoreHorizontal } from 'lucide-react';
+import AppHeader from '../components/AppHeader';
+import MessageDialog from '../components/MessageDialog';
+import { Button } from '../components/ui/button';
+import { Checkbox } from '../components/ui/checkbox';
+import { Dialog, DialogContent, DialogHeader, DialogTitle } from '../components/ui/dialog';
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from '../components/ui/dropdown-menu';
+import { Input } from '../components/ui/input';
+import { Label } from '../components/ui/label';
+import { fetchSession, hasPermission } from '../lib/session';
+
+type Role = { id: string; name: string; permissions: string[]; userCount: number };
+type PermissionOption = { id: string; name: string };
+type PermissionAction = { id: string; name: string; action: string };
+type PermissionGroup = { resource: string; actions: PermissionAction[] };
+
+const ACTION_ORDER = ['read', 'write'];
+
+function splitPermissionName(name: string): { resource: string; action: string } {
+  const separator = name.indexOf('.');
+  if (separator <= 0 || separator === name.length - 1) {
+    return { resource: name, action: name };
+  }
+  return { resource: name.slice(0, separator), action: name.slice(separator + 1) };
+}
+
+function compareActions(left: string, right: string): number {
+  const leftIndex = ACTION_ORDER.indexOf(left);
+  const rightIndex = ACTION_ORDER.indexOf(right);
+  if (leftIndex === -1 && rightIndex === -1) return left.localeCompare(right);
+  if (leftIndex === -1) return 1;
+  if (rightIndex === -1) return -1;
+  return leftIndex - rightIndex;
+}
+
+function groupPermissions(options: PermissionOption[]): PermissionGroup[] {
+  const groups: PermissionGroup[] = [];
+  const byResource = new Map<string, PermissionGroup>();
+  for (const option of options) {
+    const { resource, action } = splitPermissionName(option.name);
+    const existing = byResource.get(resource);
+    if (existing) {
+      existing.actions.push({ id: option.id, name: option.name, action });
+      continue;
+    }
+    const group = { resource, actions: [{ id: option.id, name: option.name, action }] };
+    byResource.set(resource, group);
+    groups.push(group);
+  }
+  for (const group of groups) {
+    group.actions.sort((left, right) => compareActions(left.action, right.action));
+  }
+  return groups;
+}
+
+function isRole(value: unknown): value is Role {
+  if (!value || typeof value !== 'object') return false;
+  const row = value as Record<string, unknown>;
+  return typeof row.id === 'string'
+    && typeof row.name === 'string'
+    && typeof row.userCount === 'number'
+    && Array.isArray(row.permissions)
+    && row.permissions.every((item) => typeof item === 'string');
+}
+
+function isPermissionOption(value: unknown): value is PermissionOption {
+  if (!value || typeof value !== 'object') return false;
+  const row = value as Record<string, unknown>;
+  return typeof row.id === 'string' && typeof row.name === 'string';
+}
+
+export default function AdminRoles() {
+  const [items, setItems] = useState<Role[]>([]);
+  const [permissionOptions, setPermissionOptions] = useState<PermissionOption[]>([]);
+  const [canWrite, setCanWrite] = useState(false);
+  const [open, setOpen] = useState(false);
+  const [editing, setEditing] = useState<Role | null>(null);
+  const [name, setName] = useState('');
+  const [selected, setSelected] = useState<string[]>([]);
+  const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<{ title: string; message: string } | null>(null);
+
+  async function load() {
+    const res = await fetch('/api/admin/roles');
+    if (res.status === 403) {
+      setItems([]);
+      setPermissionOptions([]);
+      return;
+    }
+    const data: unknown = await res.json();
+    if (!data || typeof data !== 'object') {
+      throw new Error('Invalid roles response');
+    }
+    const payload = data as { items?: unknown; permissions?: unknown };
+    setItems(Array.isArray(payload.items) ? payload.items.filter(isRole) : []);
+    setPermissionOptions(Array.isArray(payload.permissions) ? payload.permissions.filter(isPermissionOption) : []);
+  }
+
+  useEffect(() => {
+    (async () => {
+      const session = await fetchSession();
+      setCanWrite(hasPermission(session, 'roles.write'));
+      await load();
+    })();
+  }, []);
+
+  function openCreate() {
+    setEditing(null);
+    setName('');
+    setSelected([]);
+    setError(null);
+    setOpen(true);
+  }
+
+  function openEdit(role: Role) {
+    setEditing(role);
+    setName(role.name);
+    setSelected([...role.permissions]);
+    setError(null);
+    setOpen(true);
+  }
+
+  function togglePermission(permission: string, checked: boolean) {
+    setSelected((current) => (
+      checked ? Array.from(new Set([...current, permission])) : current.filter((item) => item !== permission)
+    ));
+  }
+
+  async function save() {
+    setError(null);
+    const path = editing ? `/api/admin/roles/${editing.id}` : '/api/admin/roles';
+    const res = await fetch(path, {
+      method: editing ? 'PUT' : 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name, permissions: selected }),
+    });
+    if (!res.ok) {
+      const data: unknown = await res.json().catch(() => null);
+      const message = data && typeof data === 'object' && typeof (data as { error?: unknown }).error === 'string'
+        ? (data as { error: string }).error
+        : 'Save failed';
+      setError(message);
+      return;
+    }
+    setOpen(false);
+    await load();
+  }
+
+  async function removeRole(role: Role) {
+    const res = await fetch(`/api/admin/roles/${role.id}`, { method: 'DELETE' });
+    if (!res.ok) {
+      const data: unknown = await res.json().catch(() => null);
+      const message = data && typeof data === 'object' && typeof (data as { error?: unknown }).error === 'string'
+        ? (data as { error: string }).error
+        : 'Delete failed';
+      setNotice({ title: 'Delete failed', message });
+      return;
+    }
+    await load();
+  }
+
+  return (
+    <div className="min-h-screen">
+      <AppHeader />
+      <MessageDialog notice={notice} onClose={() => setNotice(null)} />
+      <div className="container mx-auto py-8">
+        <div className="mb-4 flex items-center justify-between">
+          <h1 className="text-2xl font-semibold">Roles</h1>
+          {canWrite && <Button onClick={openCreate}>New Role</Button>}
+        </div>
+        <div className="overflow-x-auto rounded-md border">
+          <table className="w-full text-sm">
+            <thead>
+              <tr className="bg-muted/50">
+                <th className="p-2 text-left font-semibold">Name</th>
+                <th className="p-2 text-left font-semibold">Permissions</th>
+                <th className="p-2 text-left font-semibold">Users</th>
+                <th className="p-2 text-left font-semibold">Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              {items.map((role) => (
+                <tr key={role.id} className="border-t">
+                  <td className="p-2">{role.name}</td>
+                  <td className="p-2">{role.permissions.length ? role.permissions.join(', ') : '—'}</td>
+                  <td className="p-2">{role.userCount}</td>
+                  <td className="p-2">
+                    {canWrite && (
+                      <DropdownMenu>
+                        <DropdownMenuTrigger asChild>
+                          <Button
+                            variant="ghost"
+                            size="icon"
+                            className="h-8 w-8"
+                            aria-label={`Actions for ${role.name}`}
+                          >
+                            <MoreHorizontal />
+                          </Button>
+                        </DropdownMenuTrigger>
+                        <DropdownMenuContent align="end">
+                          <DropdownMenuItem onClick={() => openEdit(role)}>Edit</DropdownMenuItem>
+                          <DropdownMenuSeparator />
+                          <DropdownMenuItem
+                            className="text-destructive focus:bg-destructive/15 focus:text-destructive"
+                            onClick={() => removeRole(role)}
+                          >
+                            Delete
+                          </DropdownMenuItem>
+                        </DropdownMenuContent>
+                      </DropdownMenu>
+                    )}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+        <Dialog open={open} onOpenChange={setOpen}>
+          <DialogContent>
+            <DialogHeader>
+              <DialogTitle>{editing ? 'Edit Role' : 'Create Role'}</DialogTitle>
+            </DialogHeader>
+            <div className="grid gap-3">
+              <div>
+                <Label htmlFor="role-name">Name</Label>
+                <Input id="role-name" value={name} onChange={(event) => setName(event.target.value)} />
+              </div>
+              <div className="grid gap-2">
+                <span className="text-sm font-medium">Permissions</span>
+                {groupPermissions(permissionOptions).map((group) => (
+                  <div key={group.resource} className="flex flex-wrap items-center gap-x-4 gap-y-2 text-sm">
+                    <span className="w-20 shrink-0 font-medium capitalize">{group.resource}:</span>
+                    {group.actions.map((permission) => (
+                      <label key={permission.id} className="flex items-center gap-2">
+                        <Checkbox
+                          checked={selected.includes(permission.name)}
+                          onCheckedChange={(value) => togglePermission(permission.name, value === true)}
+                          aria-label={`${group.resource} ${permission.action}`}
+                        />
+                        {permission.action}
+                      </label>
+                    ))}
+                  </div>
+                ))}
+              </div>
+              {error && <p className="text-sm text-destructive">{error}</p>}
+              <Button onClick={save}>{editing ? 'Save' : 'Create'}</Button>
+            </div>
+          </DialogContent>
+        </Dialog>
+      </div>
+    </div>
+  );
+}
+
 EOF
 
 # AdminLink no longer needed; logic moved into AppHeader
