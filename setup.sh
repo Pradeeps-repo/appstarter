@@ -1,7 +1,8 @@
 #!/bin/bash
 
 # Master Script to set up Express TypeScript + React + shadcn/ui project
-# Usage: ./master-setup-express-ts-react-shadcn.sh <project-name>
+# Usage: ./setup.sh <project-name>
+# Piped install is supported: curl -fsSL <url>/setup.sh | bash -s <project-name>
 # Creates a full-stack app where Express serves the React frontend statically
 
 # Colors for output
@@ -2335,8 +2336,15 @@ cat > components.json << 'EOF'
 }
 EOF
 
-# Add shadcn/ui button component (--yes for non-interactive)
-npx shadcn@latest add button --yes
+# shadcn overwrite prompts read stdin. Under `curl | bash -s <name>` that
+# stdin is the rest of this script, so a single "overwrite dialog.tsx?"
+# question silently eats every remaining step. Close stdin on every add,
+# and install dialog+command together so command never sees an existing file.
+add_shadcn() {
+    npx shadcn@latest add "$@" --yes --overwrite </dev/null
+}
+
+add_shadcn button
 
 # Update React homepage for relative paths
 npm pkg set homepage="/"
@@ -2347,18 +2355,8 @@ npm pkg set proxy="http://localhost:${RANDOM_PORT}"
 
 # Install client routing and add shadcn inputs
 npm install --save react-router-dom
-npx shadcn@latest add input --yes
-npx shadcn@latest add label --yes
-npx shadcn@latest add dialog --yes
+add_shadcn input label dialog checkbox dropdown-menu select table badge popover command separator || true
 sed -i '' 's/border bg-background p-6/border bg-popover p-6/' src/components/ui/dialog.tsx
-npx shadcn@latest add checkbox --yes || true
-npx shadcn@latest add dropdown-menu --yes || true
-npx shadcn@latest add select --yes || true
-npx shadcn@latest add table --yes || true
-npx shadcn@latest add badge --yes || true
-npx shadcn@latest add popover --yes || true
-npx shadcn@latest add command --yes || true
-npx shadcn@latest add separator --yes || true
 
 # Do not add shadcnui-blocks table-10. That registry item installs
 # @tanstack/react-table@latest (v9) but still imports the v8 APIs
