@@ -2303,6 +2303,19 @@ module.exports = {
     alias: {
       '@': path.resolve(__dirname, 'src'),
     },
+    plugins: {
+      add: [
+        {
+          apply(compiler) {
+            compiler.hooks.done.tap({ name: 'PrintClientUrl', stage: 1000 }, () => {
+              const port = process.env.PORT;
+              if (!port) return;
+              console.log(`client started:  http://localhost:${port}`);
+            });
+          },
+        },
+      ],
+    },
   },
 };
 EOF
@@ -2685,7 +2698,7 @@ rm -f src/App.css
 
 cat > src/App.tsx << EOF
 import React from 'react';
-import { Routes, Route, Link, Navigate } from 'react-router-dom';
+import { Routes, Route, Navigate } from 'react-router-dom';
 import { Button } from './components/ui/button';
 import AppHeader from './components/AppHeader';
 import Login from './pages/Login';
@@ -3021,7 +3034,7 @@ EOF
 
 # Admin Users page (shadcn table integration)
 cat > src/pages/AdminUsers.tsx << 'EOF'
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { ChevronLeft, ChevronRight, MoreHorizontal } from 'lucide-react';
 import AppHeader from '../components/AppHeader';
 import MessageDialog from '../components/MessageDialog';
@@ -3113,7 +3126,7 @@ export default function AdminUsers() {
   const [copied, setCopied] = useState(false);
   const [notice, setNotice] = useState<{ title: string; message: string } | null>(null);
 
-  async function load() {
+  const load = useCallback(async () => {
     const res = await fetch(`/api/admin/users?q=${encodeURIComponent(q)}&page=${page}&pageSize=${pageSize}`);
     if (res.status === 403) {
       setItems([]);
@@ -3129,7 +3142,7 @@ export default function AdminUsers() {
     setItems(Array.isArray(payload.items) ? payload.items.filter(isUser) : []);
     setTotal(typeof payload.total === 'number' ? payload.total : 0);
     setRoleOptions(Array.isArray(payload.roleOptions) ? payload.roleOptions.filter((item): item is string => typeof item === 'string') : []);
-  }
+  }, [q, page, pageSize]);
 
   useEffect(() => {
     (async () => {
@@ -3138,7 +3151,7 @@ export default function AdminUsers() {
     })();
   }, []);
 
-  useEffect(() => { load(); }, [q, page, pageSize]);
+  useEffect(() => { void load(); }, [load]);
 
   useEffect(() => {
     setForm((current) => {
@@ -3418,6 +3431,8 @@ type Props = { children: ReactNode; roles?: string[]; permissions?: string[] };
 
 export default function ProtectedRoute({ children, roles, permissions }: Props) {
   const [allowed, setAllowed] = useState<boolean | null>(null);
+  const roleKey = (roles ?? []).join(',');
+  const permissionKey = (permissions ?? []).join(',');
 
   useEffect(() => {
     (async () => {
@@ -3426,12 +3441,14 @@ export default function ProtectedRoute({ children, roles, permissions }: Props) 
         setAllowed(false);
         return;
       }
-      const roleOk = !roles || roles.length === 0 || roles.some((role) => session.roles.includes(role));
-      const permissionOk = !permissions || permissions.length === 0
-        || permissions.some((permission) => session.permissions.includes(permission));
+      const requiredRoles = roleKey.length > 0 ? roleKey.split(',') : [];
+      const requiredPermissions = permissionKey.length > 0 ? permissionKey.split(',') : [];
+      const roleOk = requiredRoles.length === 0 || requiredRoles.some((role) => session.roles.includes(role));
+      const permissionOk = requiredPermissions.length === 0
+        || requiredPermissions.some((permission) => session.permissions.includes(permission));
       setAllowed(roleOk && permissionOk);
     })();
-  }, [roles?.join(','), permissions?.join(',')]);
+  }, [roleKey, permissionKey]);
 
   if (allowed === null) return <div className="p-4 text-center text-sm text-muted-foreground">Loading...</div>;
   return allowed ? <>{children}</> : <Navigate to="/" replace />;
