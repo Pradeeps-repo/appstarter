@@ -58,17 +58,37 @@ EOF
 
 # Step 4: Install TypeScript dependencies
 echo -e "${YELLOW}Step 4: Installing TypeScript dependencies...${NC}"
-npm install --save-dev typescript @types/node @types/express @types/cookie-parser @types/morgan @types/http-errors @types/debug ts-node nodemon concurrently chokidar-cli dotenv @types/dotenv
+# Pin TypeScript 6: npm's typescript@latest is now 7 (Go rewrite) and no longer
+# exposes ts.sys. ts-node 10.9.x then crashes with:
+# TypeError: Cannot read properties of undefined (reading 'fileExists')
+npm install --save-dev typescript@6 @types/node @types/express @types/cookie-parser @types/morgan @types/http-errors @types/debug ts-node nodemon concurrently dotenv @types/dotenv
 
-# Step 5: Generate random port and create .env file
-echo -e "${YELLOW}Step 5: Creating .env file with random port...${NC}"
+# Step 5: Generate random port, secrets, and create .env file
+echo -e "${YELLOW}Step 5: Creating .env file with random port and generated secrets...${NC}"
 RANDOM_PORT=$((RANDOM % 9000 + 3000))
+CLIENT_DEV_PORT=$((RANDOM_PORT + 1))
+
+# Generate cryptographically random secrets (node first, openssl as fallback)
+generate_secret() {
+    node -e "console.log(require('crypto').randomBytes(32).toString('hex'))" 2>/dev/null \
+        || openssl rand -hex 32 2>/dev/null
+}
+SESSION_SECRET_VALUE=$(generate_secret)
+JWT_SECRET_VALUE=$(generate_secret)
+if [ -z "${SESSION_SECRET_VALUE}" ] || [ -z "${JWT_SECRET_VALUE}" ]; then
+    echo -e "${RED}❌ Error: Failed to generate secrets. Node.js or OpenSSL is required.${NC}"
+    exit 1
+fi
+
 cat > .env << EOF
 PORT=${RANDOM_PORT}
 NODE_ENV=development
+SESSION_SECRET=${SESSION_SECRET_VALUE}
+JWT_SECRET=${JWT_SECRET_VALUE}
 EOF
 
 echo -e "${GREEN}📝 Generated random port: ${RANDOM_PORT}${NC}"
+echo -e "${GREEN}🔐 Generated SESSION_SECRET and JWT_SECRET in .env${NC}"
 
 # Step 5.1: Create comprehensive .gitignore file
 echo -e "${YELLOW}Step 5.1: Creating .gitignore file...${NC}"
@@ -142,7 +162,6 @@ jspm_packages/
 
 # Gatsby files
 .cache/
-public
 
 # Storybook build outputs
 .out
@@ -283,12 +302,21 @@ cat > app.ts << 'EOF'
 import createError from 'http-errors';
 import express, { Request, Response, NextFunction } from 'express';
 import path from 'path';
+import fs from 'fs';
 import cookieParser from 'cookie-parser';
 import logger from 'morgan';
 
 import indexRouter from './routes/index';
 
 const app = express();
+
+// Determine if running from source (ts-node) or compiled (dist/)
+// When running with ts-node, __dirname is the project root where app.ts exists
+// When running compiled, __dirname is dist/ where app.js exists
+const isRunningFromSource = fs.existsSync(path.join(__dirname, 'app.ts'));
+const clientPath = isRunningFromSource
+  ? path.join(__dirname, 'dist', 'client')  // ts-node: client build is in dist/client
+  : path.join(__dirname, 'client');          // compiled: client build is in dist/client (relative to dist/)
 
 app.use(logger('dev'));
 app.use(express.json());
@@ -299,8 +327,8 @@ app.use(cookieParser());
 app.use(express.static(path.join(__dirname, 'public')));
 
 // Step 8: Add code to statically serve the client frontend
-// Serve React client build files statically from dist/client - this ensures the client is served from Express
-app.use(express.static(path.join(__dirname, 'client')));
+// Serve React client build files statically - path adapts to dev vs production
+app.use(express.static(clientPath));
 
 // API routes (if any) should be defined before the catch-all
 app.use('/api', indexRouter);
@@ -308,7 +336,7 @@ app.use('/api', indexRouter);
 // Step 9: Catch-all handler to serve React app for client-side routing
 // This ensures the client never runs its own server - everything goes through Express
 app.get('*', (req: Request, res: Response) => {
-  res.sendFile(path.join(__dirname, 'client', 'index.html'));
+  res.sendFile(path.join(clientPath, 'index.html'));
 });
 
 // catch 404 and forward to error handler
@@ -437,9 +465,9 @@ rm -rf views/ # Remove entire views directory since we're serving React frontend
 echo -e "${YELLOW}Step 9: Updating package.json scripts...${NC}"
 # Create a new package.json with updated scripts including concurrent development
 npm pkg set scripts.start="node ./dist/bin/www.js"
-npm pkg set scripts.dev="concurrently \"npm run dev:server\" \"npm run dev:client\""
+npm pkg set scripts.dev="concurrently -n server,client -c blue,green \"npm run dev:server\" \"npm run dev:client\""
 npm pkg set scripts.dev:server="nodemon --exec ts-node ./bin/www.ts --watch . --ext ts,js,json --ignore client/ --ignore node_modules/ --ignore dist/"
-npm pkg set scripts.dev:client="chokidar \"client/src/**/*\" -c \"cd client && npm run build && echo 'Client rebuilt to dist/client/'\""
+npm pkg set scripts.dev:client="cd client && BROWSER=none PORT=${CLIENT_DEV_PORT} npm start"
 npm pkg set scripts.build="tsc"
 npm pkg set scripts.clean="rm -rf dist"
 npm pkg set scripts.build:client="cd client && npm run build"
@@ -527,13 +555,10 @@ EOF
         fi
     }
 
-    # Generate secrets if missing
-    SESSION_SECRET_VALUE=$(node -e "console.log(require('crypto').randomBytes(32).toString('hex'))" 2>/dev/null)
-    JWT_SECRET_VALUE=$(node -e "console.log(require('crypto').randomBytes(32).toString('hex'))" 2>/dev/null)
-
+    # Secrets were generated in Step 5; ensure they exist if .env was recreated
     ensure_env "SQLITE_STORAGE" "./var/dev.sqlite"
-    ensure_env "SESSION_SECRET" "${SESSION_SECRET_VALUE:-change-me-session}"
-    ensure_env "JWT_SECRET" "${JWT_SECRET_VALUE:-change-me-jwt}"
+    ensure_env "SESSION_SECRET" "${SESSION_SECRET_VALUE}"
+    ensure_env "JWT_SECRET" "${JWT_SECRET_VALUE}"
     ensure_env "JWT_ACCESS_TTL" "15m"
     ensure_env "JWT_REFRESH_TTL" "7d"
     ensure_env "PUBLIC_BASE_URL" "http://localhost:${RANDOM_PORT}"
@@ -728,8 +753,14 @@ import crypto from 'crypto';
 import { addMs } from './ttl';
 import models from '../models';
 
+export function requireJwtSecret(): Secret {
+  const secret = process.env.JWT_SECRET;
+  if (!secret) throw new Error('JWT_SECRET is not set. Add it to your .env file.');
+  return secret;
+}
+
 export function issueAccessToken(user: any, roles: string[], permissions: string[] = []) {
-  const secret: Secret = (process.env.JWT_SECRET as string) || 'change-me';
+  const secret = requireJwtSecret();
   const ttl = (process.env.JWT_ACCESS_TTL as string) || '15m';
   const payload = { sub: user.id, roles, permissions };
   const options: SignOptions = { expiresIn: ttl as any };
@@ -757,8 +788,7 @@ export async function rotateRefreshToken(userId: string, presentedToken: string)
 }
 
 export function verifyAccessToken(token: string) {
-  const secret: Secret = (process.env.JWT_SECRET as string) || 'change-me';
-  return jwt.verify(token, secret);
+  return jwt.verify(token, requireJwtSecret());
 }
 EOF
 
@@ -813,9 +843,14 @@ passport.use(new LocalStrategy({ usernameField: 'email' }, async (email: string,
   }
 }));
 
+const jwtSecret = process.env.JWT_SECRET;
+if (!jwtSecret) {
+  throw new Error('JWT_SECRET is not set. Add it to your .env file.');
+}
+
 passport.use(new JwtStrategy({
   jwtFromRequest: ExtractJwt.fromAuthHeaderAsBearerToken(),
-  secretOrKey: (process.env.JWT_SECRET as string) || 'change-me',
+  secretOrKey: jwtSecret,
 }, async (payload: any, done: (err: any, user?: any, info?: any) => void) => {
   try {
     const user: any = await models.User.findByPk(payload.sub);
@@ -1146,6 +1181,7 @@ EOF
 import createError from 'http-errors';
 import express, { Request, Response, NextFunction } from 'express';
 import path from 'path';
+import fs from 'fs';
 import cookieParser from 'cookie-parser';
 import logger from 'morgan';
 import session from 'express-session';
@@ -1161,6 +1197,14 @@ import rateLimit from 'express-rate-limit';
 
 const app = express();
 
+// Determine if running from source (ts-node) or compiled (dist/)
+// When running with ts-node, __dirname is the project root where app.ts exists
+// When running compiled, __dirname is dist/ where app.js exists
+const isRunningFromSource = fs.existsSync(path.join(__dirname, 'app.ts'));
+const clientPath = isRunningFromSource
+  ? path.join(__dirname, 'dist', 'client')  // ts-node: client build is in dist/client
+  : path.join(__dirname, 'client');          // compiled: client build is in dist/client (relative to dist/)
+
 // Logger (plain in dev, combined in prod)
 app.use(logger(process.env.NODE_ENV === 'production' ? 'combined' : 'dev'));
 app.use(express.json());
@@ -1170,8 +1214,8 @@ app.use(cookieParser());
 // Serve static files from public directory
 app.use(express.static(path.join(__dirname, 'public')));
 
-// Serve React client build files statically from dist/client
-app.use(express.static(path.join(__dirname, 'client')));
+// Serve React client build files statically - path adapts to dev vs production
+app.use(express.static(clientPath));
 
 // Security
 app.use(helmet());
@@ -1180,6 +1224,11 @@ const maxReq = parseInt(process.env.RATE_LIMIT_MAX || '100', 10);
 app.use(['/auth', '/api/auth'], rateLimit({ windowMs, max: maxReq }));
 
 // Sessions (web) with Sequelize store
+const sessionSecret = process.env.SESSION_SECRET;
+if (!sessionSecret) {
+  throw new Error('SESSION_SECRET is not set. Add it to your .env file.');
+}
+const SESSION_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 const SequelizeStore = require('connect-session-sequelize')(session.Store);
 const store = new SequelizeStore({ db: sequelize });
 const isProduction = process.env.NODE_ENV === 'production';
@@ -1187,13 +1236,17 @@ if (isProduction) {
   app.set('trust proxy', 1);
 }
 app.use(session({
-  secret: process.env.SESSION_SECRET || 'change-me',
+  secret: sessionSecret,
   resave: false,
   saveUninitialized: false,
+  rolling: true, // extend session expiry on activity
   store,
-  cookie: { httpOnly: true, sameSite: 'lax', secure: isProduction },
+  cookie: { httpOnly: true, sameSite: 'lax', secure: isProduction, maxAge: SESSION_MAX_AGE_MS },
 }));
-store.sync();
+store.sync().catch((err: unknown) => {
+  console.error('Failed to sync session store:', err);
+  process.exit(1);
+});
 
 // CORS from env
 const origins = (process.env.CLIENT_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean);
@@ -1209,7 +1262,7 @@ app.use('/api/admin/users', adminUsers);
 
 // Catch-all handler to serve React app for client-side routing
 app.get('*', (req: Request, res: Response) => {
-  res.sendFile(path.join(__dirname, 'client', 'index.html'));
+  res.sendFile(path.join(clientPath, 'index.html'));
 });
 
 // 404 handler
@@ -1696,7 +1749,11 @@ EOF
 npx shadcn@latest add button --yes
 
 # Update React homepage for relative paths
-npm pkg set homepage="."
+npm pkg set homepage="/"
+
+# Proxy API/auth requests from the CRA dev server to the Express backend,
+# so session cookies stay same-origin during development
+npm pkg set proxy="http://localhost:${RANDOM_PORT}"
 
 # Install client routing and add shadcn inputs
 npm install --save react-router-dom
@@ -1711,7 +1768,12 @@ npx shadcn@latest add badge --yes || true
 npx shadcn@latest add popover --yes || true
 npx shadcn@latest add command --yes || true
 npx shadcn@latest add separator --yes || true
-npx shadcn@latest add https://www.shadcnui-blocks.com/r/table-10.json --yes || true
+
+# Do not add shadcnui-blocks table-10. That registry item installs
+# @tanstack/react-table@latest (v9) but still imports the v8 APIs
+# (getCoreRowModel, getFilteredRowModel, …), which fails the client build:
+# TS2724: '"@tanstack/react-table"' has no exported member named 'getCoreRowModel'.
+# A compatible Table10 is written below.
 
 # Fix any incorrect component imports from third-party components
 echo -e "${YELLOW}Fixing import paths in generated components...${NC}"
@@ -1802,7 +1864,6 @@ export default function AppHeader() {
 }
 EOF
 
-if [ ! -f src/components/customized/table/table-10.tsx ]; then
 mkdir -p src/components/customized/table
 cat > src/components/customized/table/table-10.tsx << 'EOF'
 import React from 'react';
@@ -1853,7 +1914,6 @@ export default function Table10({ data, columns, total, page, pageSize, onPageCh
   );
 }
 EOF
-fi
 
 # Delete App.css and update App.tsx
 rm -f src/App.css
@@ -2253,6 +2313,13 @@ EOF
 # AdminLink no longer needed; logic moved into AppHeader
 
 # Step 11: Build client and return to project root
+# TanStack Table v9 removed getCoreRowModel. If a registry component still
+# uses the v8 API, pin v8 so the client build does not fail.
+if grep -Rql --include='*.tsx' --include='*.ts' 'getCoreRowModel' src 2>/dev/null; then
+  echo -e "${YELLOW}Pinning @tanstack/react-table@8 (v9 removed getCoreRowModel)...${NC}"
+  npm install --save @tanstack/react-table@8
+fi
+
 echo -e "${YELLOW}Step 11: Building React client...${NC}"
 npm run build
 
@@ -2410,8 +2477,8 @@ echo -e "${GREEN}  ✅ MVC architecture (controllers/routes)${NC}"
 echo -e "${GREEN}  ✅ React with TypeScript${NC}"
 echo -e "${GREEN}  ✅ shadcn/ui components${NC}"
 echo -e "${GREEN}  ✅ Tailwind CSS${NC}"
-echo -e "${GREEN}  ✅ Static serving from Express${NC}"
-echo -e "${GREEN}  ✅ Single server architecture (no separate React server)${NC}"
+echo -e "${GREEN}  ✅ Static serving from Express (single server in production)${NC}"
+echo -e "${GREEN}  ✅ React dev server with API proxy in development${NC}"
 echo -e "${GREEN}  ✅ Clean build organization (all outputs in dist/)${NC}"
 echo -e "${GREEN}  ✅ Random port generation with .env support${NC}"
 echo -e "${GREEN}  ✅ Concurrent development with file watching${NC}"
@@ -2442,13 +2509,13 @@ echo -e "${YELLOW}🌐 To start development server:${NC}"
 echo -e "${GREEN}  cd ${PROJECT_NAME}${NC}"
 echo -e "${GREEN}  npm run dev${NC}"
 echo ""
-echo -e "${YELLOW}📡 Your app will be available at: http://localhost:${RANDOM_PORT}${NC}"
-echo -e "${YELLOW}📡 API endpoint will be: http://localhost:${RANDOM_PORT}/api${NC}"
+echo -e "${YELLOW}📡 Dev frontend (hot reload): http://localhost:${CLIENT_DEV_PORT}${NC}"
+echo -e "${YELLOW}📡 Backend + API: http://localhost:${RANDOM_PORT}/api${NC}"
 echo ""
 echo -e "${BLUE}💡 Development commands:${NC}"
-echo -e "${GREEN}  npm run dev           # 🚀 Concurrent development (recommended)${NC}"
+echo -e "${GREEN}  npm run dev           # 🚀 Backend + React dev server (recommended)${NC}"
 echo -e "${GREEN}  npm run dev:server    # Server only with TypeScript watching${NC}"
-echo -e "${GREEN}  npm run dev:client    # Client build watch only${NC}"
+echo -e "${GREEN}  npm run dev:client    # React dev server only (proxies to backend)${NC}"
 echo -e "${GREEN}  npm run build:all     # Build both client and server${NC}"
 echo -e "${GREEN}  npm start             # Start production server${NC}"
 echo ""
