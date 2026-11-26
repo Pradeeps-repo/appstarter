@@ -572,6 +572,24 @@ EOF
     ensure_env "SMTP_USER" ""
     ensure_env "SMTP_PASS" ""
     ensure_env "SMTP_FROM" ""
+    # Names only. Values come from the environment when the operator set them.
+    ensure_env "ADMIN_EMAIL" "${ADMIN_EMAIL-}"
+    ensure_env "ADMIN_PASSWORD" "${ADMIN_PASSWORD-}"
+
+    cat > .env.example << 'EOF'
+# Set both before npm run db:seed. The seeder refuses to run when either is empty.
+ADMIN_EMAIL=
+ADMIN_PASSWORD=
+EOF
+
+    if ! grep -q '^## Admin user$' README.md 2>/dev/null; then
+      cat >> README.md << 'EOF'
+
+## Admin user
+
+The RBAC seeder does not create a default admin account. Setup skips seeding when ADMIN_EMAIL or ADMIN_PASSWORD is empty. Running npm run db:seed refuses to write unless both are set. See .env.example.
+EOF
+    fi
 
     echo -e "${YELLOW}Auth/RBAC: Adding npm database scripts...${NC}"
     npm pkg set scripts.db:migrate="sequelize-cli db:migrate"
@@ -1333,6 +1351,18 @@ const { randomUUID } = require('crypto');
 
 module.exports = {
   async up(queryInterface, Sequelize) {
+    const adminEmailRaw = process.env.ADMIN_EMAIL;
+    const adminPassword = process.env.ADMIN_PASSWORD;
+    const adminEmail = typeof adminEmailRaw === 'string' ? adminEmailRaw.trim() : '';
+    const missing = [];
+    if (adminEmail === '') missing.push('ADMIN_EMAIL');
+    if (typeof adminPassword !== 'string' || adminPassword.trim() === '') missing.push('ADMIN_PASSWORD');
+    if (missing.length > 0) {
+      throw new Error(
+        'Refusing to seed. Set ' + missing.join(' and ') + ' in the environment. No default admin account is provided.'
+      );
+    }
+
     const [adminRoleId, userRoleId] = [randomUUID(), randomUUID()];
     const [usersReadId, usersWriteId, rolesReadId, rolesWriteId] = [
       randomUUID(),
@@ -1360,8 +1390,6 @@ module.exports = {
       { roleId: adminRoleId, permissionId: rolesWriteId, createdAt: new Date(), updatedAt: new Date() },
     ]);
 
-    const adminEmail = process.env.ADMIN_EMAIL || 'admin@example.com';
-    const adminPassword = process.env.ADMIN_PASSWORD || 'Admin123!';
     const passwordHash = await bcrypt.hash(adminPassword, 12);
     const adminUserId = randomUUID();
 
@@ -1393,7 +1421,17 @@ EOF
       if [ "${RUN_DB_SEEDS}" = "1" ]; then echo -e "${YELLOW}Skipping seeds in production by default.${NC}"; RUN_DB_SEEDS=0; fi
     fi
     if [ "${RUN_DB_MIGRATIONS}" = "1" ]; then npx sequelize-cli db:migrate; fi
-    if [ "${RUN_DB_SEEDS}" = "1" ]; then npx sequelize-cli db:seed:all; fi
+    if [ "${RUN_DB_SEEDS}" = "1" ]; then
+      if [ -z "${ADMIN_EMAIL//[[:space:]]/}" ] || [ -z "${ADMIN_PASSWORD//[[:space:]]/}" ]; then
+        echo -e "${YELLOW}Skipping database seed: set ADMIN_EMAIL and ADMIN_PASSWORD, then run npm run db:seed. No default admin account is created.${NC}"
+      else
+        npx sequelize-cli db:seed:all
+        if [ $? -ne 0 ]; then
+          echo -e "${RED}❌ Database seed failed.${NC}"
+          exit 1
+        fi
+      fi
+    fi
 
     echo -e "${YELLOW}Auth/RBAC: Updating server to wire sessions, Passport, and routes...${NC}"
     cat > app.ts << 'EOF'
@@ -2793,8 +2831,8 @@ import { Input } from '../components/ui/input';
 import { Label } from '../components/ui/label';
 
 export default function Login() {
-  const [email, setEmail] = useState('admin@example.com');
-  const [password, setPassword] = useState('Admin123!');
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
   const [message, setMessage] = useState<string | null>(null);
   const navigate = useNavigate();
 
@@ -3895,6 +3933,9 @@ echo -e "${GREEN}  ✅ Concurrent development with file watching${NC}"
 echo -e "${GREEN}  ✅ API endpoints on /api routes${NC}"
 echo -e "${GREEN}  ✅ Client-side routing support with catch-all${NC}"
 echo -e "${GREEN}  ✅ Custom branding with project name (${PROJECT_NAME})${NC}"
+if [ "${ENABLE_AUTH_RBAC}" = "1" ]; then
+  echo -e "${GREEN}  ✅ No default admin account. Set ADMIN_EMAIL and ADMIN_PASSWORD, then npm run db:seed${NC}"
+fi
 echo -e "${GREEN}  ✅ Custom dice icon from GitHub repository${NC}"
 echo -e "${GREEN}  ✅ All default React references replaced with project name${NC}"
 echo -e "${GREEN}  ✅ Git repository initialization with comprehensive .gitignore${NC}"

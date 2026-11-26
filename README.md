@@ -14,3 +14,7 @@
    - MVC architecture
    - Concurrent development setup
    - Clean build organization
+
+   ## Admin seed
+
+   Generated apps do not include a default admin email or password. Setup skips the database seed when `ADMIN_EMAIL` or `ADMIN_PASSWORD` is empty. Running the seeder directly refuses to write unless both are set. The generated `.env.example` names those variables and leaves the values empty. Put real values in `.env` or the process environment, then run `npm run db:seed`.
