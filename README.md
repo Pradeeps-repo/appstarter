@@ -11,6 +11,7 @@
    ## What it creates
    - Express.js with TypeScript
    - React with TypeScript & shadcn/ui
+   - One brand theme block in `client/src/index.css` (colours, radius, fonts). Generated apps include `client/THEMING.md` for re-skinning and dark mode.
    - MVC architecture
    - Concurrent development setup
    - Clean build organization

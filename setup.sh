@@ -2041,6 +2041,10 @@ module.exports = {
           DEFAULT: "hsl(var(--card))",
           foreground: "hsl(var(--card-foreground))",
         },
+        brand: {
+          DEFAULT: "hsl(var(--brand))",
+          foreground: "hsl(var(--brand-foreground))",
+        },
       },
       borderRadius: {
         lg: "var(--radius)",
@@ -2049,6 +2053,7 @@ module.exports = {
       },
       fontFamily: {
         sans: ["var(--font-sans)", ...fontFamily.sans],
+        display: ["var(--font-display)", ...fontFamily.sans],
       },
       keyframes: {
         "accordion-down": {
@@ -2077,6 +2082,11 @@ cat > src/index.css << 'EOF'
 @tailwind utilities;
 
 @layer base {
+  /* BRAND THEME
+     All brand changes go here.
+     Components must use Tailwind semantic classes or these variables, never raw hex.
+     Colour tokens are HSL components (hue saturation% lightness%), not hex values.
+     --font-sans and --font-display are full font stacks. See ../THEMING.md. */
   :root {
     --background: 0 0% 100%;
     --foreground: 222.2 47.4% 11.2%;
@@ -2107,7 +2117,13 @@ cat > src/index.css << 'EOF'
 
     --ring: 215 20.2% 65.1%;
 
+    --brand: 222.2 47.4% 11.2%;
+    --brand-foreground: 210 40% 98%;
+
     --radius: 0.5rem;
+
+    --font-sans: sans-serif;
+    --font-display: sans-serif;
   }
 
   .dark {
@@ -2141,6 +2157,9 @@ cat > src/index.css << 'EOF'
 
     --ring: 215 12% 62%;
 
+    --brand: 210 16% 93%;
+    --brand-foreground: 222 10% 10%;
+
     --radius: 0.5rem;
   }
 }
@@ -2158,7 +2177,7 @@ cat > src/index.css << 'EOF'
     min-height: 100lvh;
   }
   body {
-    font-family: sans-serif;
+    font-family: var(--font-sans), sans-serif;
     margin: 0;
   }
 }
@@ -2170,6 +2189,63 @@ cat > src/index.css << 'EOF'
   min-height: 100dvh;
   min-height: 100lvh;
 }
+EOF
+
+# How to re-skin the generated app. Lives next to src/index.css.
+cat > THEMING.md << 'EOF'
+# Theming
+
+Re-skin this app by editing the `BRAND THEME` block in `src/index.css` only. Do not add a second colour file, and do not put colours in components.
+
+## Rules
+
+- Change colours, radius, and fonts inside that block.
+- In components, use Tailwind semantic classes (`bg-background`, `text-foreground`, `bg-primary`, `bg-brand`, `text-brand-foreground`, `font-sans`, `font-display`, `rounded-lg`) or these CSS variables.
+- Never use raw hex in components.
+
+## Colour format
+
+Colour tokens (`--background`, `--primary`, `--brand`, and the rest) are HSL components without the `hsl()` wrapper:
+
+```css
+--brand: 222.2 47.4% 11.2%;
+```
+
+Tailwind reads them as `hsl(var(--brand))`. A hex value such as `#ffc629` in those tokens will not render. Convert it to HSL components first.
+
+`--font-sans` and `--font-display` are full font stacks, for example `"Figtree", system-ui, sans-serif`. Load the typeface (a `<link>` in `public/index.html`, or a CSS import) or the browser falls through the stack.
+
+Defaults match the previous scaffold: neutral shadcn colours, `--radius: 0.5rem`, and `sans-serif`. `--brand` starts equal to `--primary`, so `bg-brand` looks like `bg-primary` until you change it.
+
+## Tokens
+
+| Token | Class | Role |
+| --- | --- | --- |
+| `--background`, `--foreground` | `bg-background`, `text-foreground` | Page |
+| `--primary`, `--primary-foreground` | `bg-primary`, `text-primary-foreground` | Main actions |
+| `--secondary`, `--muted`, `--accent`, `--destructive` | `bg-secondary`, `text-muted-foreground`, … | Supporting UI |
+| `--brand`, `--brand-foreground` | `bg-brand`, `text-brand`, `text-brand-foreground` | Brand colour, separate from primary |
+| `--radius` | `rounded-lg`, `rounded-md`, `rounded-sm` | Corner radius |
+| `--font-sans` | `font-sans` (also the `body` font) | UI text |
+| `--font-display` | `font-display` | Headings and titles. Add the class where you want the display face |
+
+Light values are on `:root`. Dark values are on `.dark` in the same block. Fonts are set on `:root` and inherited; set the same variable again inside `.dark` only when dark mode needs a different stack. `--radius` is set in both places (both default to `0.5rem`), so change both if the corners should match.
+
+## Dark mode
+
+Dark mode is on. `src/lib/theme.ts` stores the choice in `localStorage` (`theme`) and otherwise follows the system preference. `public/index.html` applies that choice before React loads, so the first paint matches.
+
+### Theme it
+
+Edit the `.dark { ... }` section of the brand theme block. Override every colour you changed on `:root`. Leave a token out and dark mode keeps the light value.
+
+### Turn it off
+
+1. In `src/lib/theme.ts`, make `resolveTheme` always return `'light'` (ignore stored and system values).
+2. In `public/index.html`, remove the theme `<script>` in `<head>`. It would still add the `dark` class before React loads.
+3. Remove `<ThemeToggle />` from `src/components/AppHeader.tsx` and `src/components/AuthLayout.tsx`.
+
+The app then stays on the `:root` tokens. `color-scheme` stays `light`, including native form controls.
 EOF
 
 # Update tsconfig.json for client
@@ -3868,6 +3944,10 @@ Some commonly used components are
 ## Component Styling
 
 This project uses the "new-york" style variant with the "neutral" base color and CSS variables for theming, as configured in `components.json`.
+
+## Theming
+
+Colours, radius, and fonts live in the BRAND THEME block in `client/src/index.css`. Read `client/THEMING.md`. Use Tailwind semantic classes or those CSS variables. Do not add a second token layer, and do not use raw hex in components.
 EOF
 
 # Step 14: Open project in Cursor and provide instructions
@@ -3895,6 +3975,7 @@ echo -e "${GREEN}  ✅ Concurrent development with file watching${NC}"
 echo -e "${GREEN}  ✅ API endpoints on /api routes${NC}"
 echo -e "${GREEN}  ✅ Client-side routing support with catch-all${NC}"
 echo -e "${GREEN}  ✅ Custom branding with project name (${PROJECT_NAME})${NC}"
+echo -e "${GREEN}  ✅ Brand theme tokens in client/src/index.css (see client/THEMING.md)${NC}"
 echo -e "${GREEN}  ✅ Custom dice icon from GitHub repository${NC}"
 echo -e "${GREEN}  ✅ All default React references replaced with project name${NC}"
 echo -e "${GREEN}  ✅ Git repository initialization with comprehensive .gitignore${NC}"
